@@ -20,6 +20,14 @@ from core.preprocess_windowed import create_chunks_from_wkt, process_chunk, merg
 from core.extract_footprints import extract_footprint_batch
 from core.utils import split_gpkg
 
+def _list_las_laz_files(las_file_dir):
+    exts = (".las", ".laz")
+    return sorted(
+        os.path.join(las_file_dir, f)
+        for f in os.listdir(las_file_dir)
+        if not f.startswith(".") and f.lower().endswith(exts)
+    )
+
 
 def get_las_header(las_file):
     with laspy.open(las_file) as las:
@@ -60,24 +68,58 @@ def plot_target_and_footprints(target_gdf, matched_las_paths, las_footprint_dir,
     plt.close()
 
 
-def match_footprints(target_footprint_dir, las_footprint_dir, las_file_dir, out_dir, threshold=0.5, filter_date=True, start_date=None, end_date=None):
+def match_footprints(
+    target_footprint_dir,
+    las_footprint_dir,
+    las_file_dir,
+    out_dir,
+    threshold=0.5,
+    filter_date=True,
+    start_date=None,
+    end_date=None,
+    fallback_to_all_las=True,
+):
+    import os
+    import time
+    from datetime import datetime, timedelta
+
+    import geopandas as gpd
+    import laspy
+    from tqdm import tqdm
+
+    # ---- helper: list LAS/LAZ safely (ignores .DS_Store etc.) ----
+    def _list_las_laz_files(folder):
+        exts = (".las", ".laz")
+        return sorted(
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if (not f.startswith(".")) and f.lower().endswith(exts)
+        )
+
     os.makedirs(las_footprint_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
 
     print("\nMatching Lidar footprints...")
     start = time.time()
 
-    if not os.listdir(las_footprint_dir):
+    # Generate footprints if none exist
+    if not any((f.endswith(".gpkg") and not f.startswith(".")) for f in os.listdir(las_footprint_dir)):
         print("No footprint files found. Generating footprints first.")
         extract_footprint_batch(las_file_dir, las_footprint_dir)
 
     target_footprints = [
         os.path.join(target_footprint_dir, f)
-        for f in os.listdir(target_footprint_dir) if f.endswith(".gpkg")
+        for f in os.listdir(target_footprint_dir)
+        if (not f.startswith(".")) and f.endswith(".gpkg")
     ]
     las_footprints = [
         os.path.join(las_footprint_dir, f)
-        for f in os.listdir(las_footprint_dir) if f.endswith(".gpkg")
+        for f in os.listdir(las_footprint_dir)
+        if (not f.startswith(".")) and f.endswith(".gpkg")
     ]
+
+    # Fallback list (used only if matching returns 0 files for a target)
+    all_las_laz = _list_las_laz_files(las_file_dir)
 
     target_dict = {}
 
@@ -88,67 +130,93 @@ def match_footprints(target_footprint_dir, las_footprint_dir, las_file_dir, out_
 
         for las_fp in tqdm(las_footprints, desc="Checking LAS footprints", unit="footprints"):
             las_gdf = gpd.read_file(las_fp)
+
+            # CRS harmonisation
             if target_gdf.crs != las_gdf.crs:
                 las_gdf = las_gdf.to_crs(target_gdf.crs)
 
+            # quick intersects check
             joined = gpd.sjoin(las_gdf, target_gdf, predicate="intersects")
-            if not joined.empty:
-                intersection = gpd.overlay(las_gdf, target_gdf, how="intersection")
-                intersection_area = intersection.area.sum()
-                target_area = target_gdf.geometry.area.sum()
+            if joined.empty:
+                continue
 
-                if intersection_area / target_area > threshold:
-                    las_name = os.path.splitext(os.path.basename(las_fp))[0]
-                    # Check for both .las and .laz files
-                    las_path = os.path.join(las_file_dir, las_name + ".las")
-                    laz_path = os.path.join(las_file_dir, las_name + ".laz")
-                    
-                    if os.path.exists(las_path):
-                        las_path = las_path
-                    elif os.path.exists(laz_path):
-                        las_path = laz_path
-                    else:
-                        las_path = None
+            # area overlap ratio
+            intersection = gpd.overlay(las_gdf, target_gdf, how="intersection")
+            intersection_area = float(intersection.area.sum())
+            target_area = float(target_gdf.geometry.area.sum())
 
-                    if las_path:
-                        if filter_date and (start_date or end_date):
+            if target_area <= 0:
+                continue
 
-                            if isinstance(start_date, str):
-                                start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+            if (intersection_area / target_area) <= threshold:
+                continue
 
-                            if isinstance(end_date, str):
-                                end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+            las_name = os.path.splitext(os.path.basename(las_fp))[0]
 
-                            try:
-                                with laspy.open(las_path) as las_file:
-                                    las_date = las_file.header.creation_date
+            # Check for both .las and .laz files
+            las_path = os.path.join(las_file_dir, las_name + ".las")
+            laz_path = os.path.join(las_file_dir, las_name + ".laz")
 
-                                print(f"{las_file} Creation date: {las_date}")
-                                if las_date:
-                                    if start_date and las_date < start_date:
-                                        continue
-                                    if end_date and las_date > end_date:
-                                        continue
-                                else:
-                                    continue  # Skip if no creation date
+            if os.path.exists(las_path):
+                chosen = las_path
+            elif os.path.exists(laz_path):
+                chosen = laz_path
+            else:
+                chosen = None
 
-                            except Exception as e:
-                                print(f"Failed to read LAS header from {las_path}: {e}")
-                                continue
+            if not chosen:
+                continue
 
-                        las_paths.append(las_path)
+            # Optional date filter
+            if filter_date and (start_date or end_date):
+                sd = start_date
+                ed = end_date
+
+                if isinstance(sd, str):
+                    sd = datetime.strptime(sd, "%Y-%m-%d").date()
+                if isinstance(ed, str):
+                    ed = datetime.strptime(ed, "%Y-%m-%d").date()
+
+                try:
+                    with laspy.open(chosen) as las_file:
+                        las_date = las_file.header.creation_date
+
+                    if not las_date:
+                        continue
+                    if sd and las_date < sd:
+                        continue
+                    if ed and las_date > ed:
+                        continue
+                except Exception as e:
+                    print(f"Failed to read LAS header from {chosen}: {e}")
+                    continue
+
+            las_paths.append(chosen)
+
+        # ✅ FALLBACK: if matching found nothing, proceed anyway
+        if fallback_to_all_las and len(las_paths) == 0:
+            print(
+                f"Target area: {target_name} matched 0 footprints – "
+                f"falling back to ALL LAS/LAZ in {las_file_dir}"
+            )
+            las_paths = all_las_laz.copy()
 
         target_dict[target_name] = las_paths
 
+        # Optional plot for logging (only if you have this function)
         if las_paths:
-            output_plot_path = os.path.join(out_dir, f"{target_name}_footprints.png")
-            plot_target_and_footprints(target_gdf, las_paths, las_footprint_dir, output_plot_path)
-
+            try:
+                output_plot_path = os.path.join(out_dir, f"{target_name}_footprints.png")
+                plot_target_and_footprints(target_gdf, las_paths, las_footprint_dir, output_plot_path)
+            except Exception as e:
+                print(f"Plotting footprints failed for {target_name}: {e}")
 
         print(f"Target area: {target_name}, LAS files found: {len(las_paths)}")
 
-
-    print(f"Footprint matching completed in {timedelta(seconds=int(time.time() - start))}. Found {len(target_dict)} target areas.")
+    print(
+        f"Footprint matching completed in {timedelta(seconds=int(time.time() - start))}. "
+        f"Found {len(target_dict)} target areas."
+    )
     return target_dict
 
 

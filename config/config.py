@@ -84,7 +84,7 @@ class Configuration:
 
         self.filter_date = False  # Filter las files by date
         self.start_date = '2023-07-22'  # Start date for filtering las files
-        self.end_date = '2023-07-20'  # End date for filtering las files
+        self.end_date = '2026-07-20'  # End date for filtering las files
 
         # _______ Processing _______
         self.chunk_size = 500 # Chunk size in meters for parallel processing

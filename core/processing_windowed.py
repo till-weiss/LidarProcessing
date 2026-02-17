@@ -51,10 +51,10 @@ def process_chunk_to_dsm(input_file, large_chunk_bbox, small_chunk_bbox, temp_di
         {"type": "readers.las", "filename": input_file},
         {"type": "filters.crop", "polygon": wkt_dumps(large_chunk_bbox)},
         {"type": "filters.ferry", "dimensions": "Z=>Elevation"},
-        {
-            "type": "filters.range",
-            "limits": "Classification[0:0]"  # Use all points for initial DSM
-        },
+       # FOr testing  {
+       #     "type": "filters.range",
+       #     "limits": "Classification[0:0]"  # Use all points for initial DSM
+       # },
         {"type": "filters.crop", "polygon": wkt_dumps(small_chunk_bbox)},
         {
             "type": "writers.gdal",
@@ -71,8 +71,9 @@ def process_chunk_to_dsm(input_file, large_chunk_bbox, small_chunk_bbox, temp_di
         pdal.pipeline.Pipeline(json.dumps(pipeline)).execute()
         #print("[INFO] PDAL execution completed.")
     except RuntimeError as e:
-        f"[ERROR] PDAL execution failed: {e}. Empty chunk."
+        print(f"[ERROR] PDAL execution failed: {e}. Empty chunk.")
         return None
+
 
     try:
         subprocess.run([
@@ -86,6 +87,7 @@ def process_chunk_to_dsm(input_file, large_chunk_bbox, small_chunk_bbox, temp_di
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] GDAL fillnodata failed: {e}")
 
+    return chunk_file
 
 def process_chunk_to_dem(input_file, large_chunk_bbox, small_chunk_bbox, temp_dir, rigidness, iterations, resolution, time_step, cloth_resolution=1, fill_gaps=True, filter_smrf=False, scalar=None, slope=None, window=None, threshold=None, filter_csf=False):
 
