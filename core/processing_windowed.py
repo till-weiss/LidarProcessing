@@ -12,6 +12,47 @@ import subprocess
 from shapely.geometry import box, shape
 from shapely.wkt import loads as wkt_loads, dumps as wkt_dumps
 
+
+def fill_nodata_raster_inplace(raster_path, max_distance=10, smoothing_iterations=2):
+    """Fill nodata in-place using GDAL API (cross-platform, avoids shelling out)."""
+    ds = gdal.Open(raster_path, gdal.GA_Update)
+    if ds is None:
+        raise RuntimeError(f"Could not open raster for update: {raster_path}")
+
+    band = ds.GetRasterBand(1)
+    if band is None:
+        ds = None
+        raise RuntimeError(f"Could not open band 1 in raster: {raster_path}")
+
+    mask_band = band.GetMaskBand()
+    gdal.FillNodata(
+        targetBand=band,
+        maskBand=mask_band,
+        maxSearchDist=float(max_distance),
+        smoothingIterations=int(smoothing_iterations)
+    )
+    band.FlushCache()
+    ds.FlushCache()
+    ds = None
+
+
+def warp_raster_to_bounds(src_path, dst_path, resolution, bounds, resample_alg="bilinear"):
+    """Warp raster with target resolution/alignment using GDAL API."""
+    minx, miny, maxx, maxy = bounds
+    options = gdal.WarpOptions(
+        xRes=float(resolution),
+        yRes=float(resolution),
+        resampleAlg=resample_alg,
+        targetAlignedPixels=True,
+        outputBounds=(minx, miny, maxx, maxy),
+        multithread=True
+    )
+    out_ds = gdal.Warp(dst_path, src_path, options=options)
+    if out_ds is None:
+        raise RuntimeError(f"gdal.Warp failed for {src_path}")
+    out_ds.FlushCache()
+    out_ds = None
+
 def create_chunks_from_wkt(input_wkt, chunk_size=1000, overlap=0.2):
     """
     create processing chunks based on wkt geometry of target area, with overlap enlarged by x percent, 
@@ -76,15 +117,8 @@ def process_chunk_to_dsm(input_file, large_chunk_bbox, small_chunk_bbox, temp_di
 
 
     try:
-        subprocess.run([
-            "gdal_fillnodata.py",
-            "-md", "10",
-            "-si", "2",
-            chunk_file,
-            chunk_file
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        #print("[INFO] Nodata gaps filled with GDAL.")
-    except subprocess.CalledProcessError as e:
+        fill_nodata_raster_inplace(chunk_file, max_distance=10, smoothing_iterations=2)
+    except Exception as e:
         print(f"[ERROR] GDAL fillnodata failed: {e}")
 
     return chunk_file
@@ -223,34 +257,23 @@ def process_chunk_to_dem_with_laz_outputs(input_file, large_chunk_bbox, small_ch
     minx, miny, maxx, maxy = small_chunk_bbox.bounds
 
     try:
-        subprocess.run([
-            "gdalwarp",
-            "-tr", str(resolution), str(resolution),
-            "-r", "bilinear",
-            "-tap",
-            "-te", str(minx), str(miny), str(maxx), str(maxy),
-            "-overwrite",
-            chunk_file,
-            resampled_file
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
+        warp_raster_to_bounds(
+            src_path=chunk_file,
+            dst_path=resampled_file,
+            resolution=resolution,
+            bounds=(minx, miny, maxx, maxy),
+            resample_alg="bilinear"
+        )
         shutil.move(resampled_file, chunk_file)
 
-    except subprocess.CalledProcessError as e:
-        print("[ERROR] gdalwarp failed:")
-        print(e.stderr.decode('utf-8'))
+    except Exception as e:
+        print(f"[ERROR] gdalwarp failed: {e}")
         return None
 
     if fill_gaps:
         try:
-            subprocess.run([
-                "gdal_fillnodata.py",
-                "-md", "100",
-                "-si", "2",
-                chunk_file,
-                chunk_file
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError as e:
+            fill_nodata_raster_inplace(chunk_file, max_distance=100, smoothing_iterations=2)
+        except Exception as e:
             print(f"[ERROR] GDAL fillnodata failed: {e}")
             return None
 

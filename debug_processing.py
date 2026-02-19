@@ -19,7 +19,7 @@ from core.processing_windowed import (
     process_chunk_to_dsm,
     process_chunk_to_dem_with_laz_outputs,
     merge_chunks,
-    merge_laz_chunks
+    merge_laz_chunks, fill_nodata_raster_inplace
 )
 
 
@@ -170,11 +170,12 @@ def generate_dsm(
 
         if fill_gaps and merged_dsm:
             filled_dsm_path = os.path.join(temp_dsm_dir, f"{base_name}_filled.tif")
-            subprocess.run(
-                ["gdal_fillnodata.py", "-md", "10", "-si", "2", merged_dsm, filled_dsm_path],
-                check=True
-            )
-            os.replace(filled_dsm_path, final_dsm_path)
+            try:
+                shutil.copy2(merged_dsm, filled_dsm_path)
+                fill_nodata_raster_inplace(filled_dsm_path, max_distance=10, smoothing_iterations=2)
+                os.replace(filled_dsm_path, final_dsm_path)
+            except Exception as exc:
+                print(f"[WARNING] DSM fill_nodata failed, using unfilled raster: {exc}")
 
         # --- quick plot ---
         with rasterio.open(final_dsm_path) as src:
@@ -342,11 +343,12 @@ def generate_dtm(
 
             if fill_gaps and merged_dtm:
                 filled_dtm_path = os.path.join(temp_dtm_dir, f"{base_name}_filled.tif")
-                subprocess.run(
-                    ["gdal_fillnodata.py", "-md", "10", "-si", "2", merged_dtm, filled_dtm_path],
-                    check=True
-                )
-                os.replace(filled_dtm_path, final_dtm_path)
+                try:
+                    shutil.copy2(merged_dtm, filled_dtm_path)
+                    fill_nodata_raster_inplace(filled_dtm_path, max_distance=10, smoothing_iterations=2)
+                    os.replace(filled_dtm_path, final_dtm_path)
+                except Exception as exc:
+                    print(f"[WARNING] DTM fill_nodata failed, using unfilled raster: {exc}")
         elif not os.path.exists(final_dtm_path):
             print(f"No DTM chunks found for {base_name}. Skipping.")
             _list_files_recursive(temp_dtm_dir)

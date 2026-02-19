@@ -21,7 +21,7 @@ from multiprocessing import get_context
 import multiprocessing
 from shapely.wkt import loads as wkt_loads, dumps as wkt_dumps
 
-from core.processing_windowed import create_chunks_from_wkt, process_chunk_to_dsm, process_chunk_to_dem_with_laz_outputs, merge_chunks, merge_laz_chunks
+from core.processing_windowed import create_chunks_from_wkt, process_chunk_to_dsm, process_chunk_to_dem_with_laz_outputs, merge_chunks, merge_laz_chunks, fill_nodata_raster_inplace
 
 
 def check_resolution(las_file, resolution, method="sampling", num_samples=10000):
@@ -140,9 +140,12 @@ def generate_dsm(input_folder, output_folder, run_name, method, resolution, chun
             merged_dsm = merge_chunks(chunk_files, final_dsm_path)
             if fill_gaps and merged_dsm:
                 filled_dsm_path = os.path.join(temp_dsm_dir, f"{base_name}_filled.tif")
-                subprocess.run(["gdal_fillnodata.py", "-md", "10", "-si", "2", merged_dsm, filled_dsm_path],
-                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                os.replace(filled_dsm_path, final_dsm_path)
+                try:
+                    shutil.copy2(merged_dsm, filled_dsm_path)
+                    fill_nodata_raster_inplace(filled_dsm_path, max_distance=10, smoothing_iterations=2)
+                    os.replace(filled_dsm_path, final_dsm_path)
+                except Exception as exc:
+                    print(f"[WARNING] DSM fill_nodata failed, using unfilled raster: {exc}")
 
             #read output file for plotting
             with rasterio.open(final_dsm_path) as src:
@@ -268,13 +271,12 @@ def generate_dtm(input_folder, output_folder, run_name, resolution, chunk_size, 
 
             if fill_gaps and merged_dtm:
                 filled_dtm_path = os.path.join(temp_dtm_dir, f"{base_name}_filled.tif")
-                subprocess.run(
-                    ["gdal_fillnodata.py", "-md", "10", "-si", "2", merged_dtm, filled_dtm_path],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                os.replace(filled_dtm_path, final_dtm_path)
+                try:
+                    shutil.copy2(merged_dtm, filled_dtm_path)
+                    fill_nodata_raster_inplace(filled_dtm_path, max_distance=10, smoothing_iterations=2)
+                    os.replace(filled_dtm_path, final_dtm_path)
+                except Exception as exc:
+                    print(f"[WARNING] DTM fill_nodata failed, using unfilled raster: {exc}")
 
             cleaned_chunk_files = sorted(glob.glob(os.path.join(cleaned_chunk_dir, "*_cleaned.laz")))
             classified_chunk_files = sorted(glob.glob(os.path.join(classified_chunk_dir, "*_classified.laz")))
