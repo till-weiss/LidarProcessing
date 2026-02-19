@@ -91,35 +91,120 @@ def process_chunk_to_dsm(input_file, large_chunk_bbox, small_chunk_bbox, temp_di
 
 def process_chunk_to_dem(input_file, large_chunk_bbox, small_chunk_bbox, temp_dir, rigidness, iterations, resolution, time_step, cloth_resolution=1, fill_gaps=True, filter_smrf=False, scalar=None, slope=None, window=None, threshold=None, filter_csf=False):
 
+    return process_chunk_to_dem_with_laz_outputs(
+        input_file=input_file,
+        large_chunk_bbox=large_chunk_bbox,
+        small_chunk_bbox=small_chunk_bbox,
+        temp_dir=temp_dir,
+        cleaned_chunk_dir=temp_dir,
+        classified_chunk_dir=temp_dir,
+        rigidness=rigidness,
+        iterations=iterations,
+        resolution=resolution,
+        time_step=time_step,
+        cloth_resolution=cloth_resolution,
+        fill_gaps=fill_gaps,
+        filter_smrf=filter_smrf,
+        scalar=scalar,
+        slope=slope,
+        window=window,
+        threshold=threshold,
+        filter_csf=filter_csf,
+        save_cleaned_laz=False
+    )
+
+
+def _verify_point_cloud_output(path, label):
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return True
+    print(f"[WARNING] {label} was not written or is empty: {path}")
+    return False
+
+
+def process_chunk_to_dem_with_laz_outputs(input_file, large_chunk_bbox, small_chunk_bbox, temp_dir, cleaned_chunk_dir, classified_chunk_dir, rigidness, iterations, resolution, time_step, cloth_resolution=1, fill_gaps=True, filter_smrf=False, scalar=None, slope=None, window=None, threshold=None, filter_csf=False, save_cleaned_laz=True):
+
     chunk_file = os.path.join(
         temp_dir,
         f"{os.path.basename(input_file).replace('.las', '')}_chunk_{int(small_chunk_bbox.bounds[0])}_{int(small_chunk_bbox.bounds[1])}.tif"
     )
 
-    pipeline = [
+    os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(cleaned_chunk_dir, exist_ok=True)
+    os.makedirs(classified_chunk_dir, exist_ok=True)
+
+    base_name = os.path.basename(input_file).replace('.las', '').replace('.laz', '')
+    chunk_id = f"{int(small_chunk_bbox.bounds[0])}_{int(small_chunk_bbox.bounds[1])}"
+    cleaned_out_laz = os.path.join(cleaned_chunk_dir, f"{base_name}_chunk_{chunk_id}_cleaned.laz")
+    classified_out_laz = os.path.join(classified_chunk_dir, f"{base_name}_chunk_{chunk_id}_classified.laz")
+    ground_out_laz = os.path.join(classified_chunk_dir, f"{base_name}_chunk_{chunk_id}_ground.laz")
+
+    print(f"[DEBUG] Chunk {chunk_id} outputs: cleaned={cleaned_out_laz}, classified={classified_out_laz}, ground={ground_out_laz}")
+
+    cleaning_pipeline = [
         {"type": "readers.las", "filename": input_file},
         {"type": "filters.crop", "polygon": wkt_dumps(large_chunk_bbox)},
-
+        {"type": "filters.crop", "polygon": wkt_dumps(small_chunk_bbox)},
+        {"type": "writers.las", "filename": cleaned_out_laz, "compression": "laszip"}
     ]
+
+    try:
+        pdal.pipeline.Pipeline(json.dumps(cleaning_pipeline)).execute()
+    except RuntimeError as e:
+        print(f"[INFO] PDAL cleaned chunk pipeline failed: {e}. No points in chunk.")
+        return None
+
+    if save_cleaned_laz:
+        _verify_point_cloud_output(cleaned_out_laz, "Cleaned chunk LAZ")
+
+    classification_pipeline = [
+        {"type": "readers.las", "filename": cleaned_out_laz},
+    ]
+
     if filter_smrf:
 
-        pipeline.append({"type": "filters.smrf",
+        classification_pipeline.append({"type": "filters.smrf",
          "scalar": float(scalar),
          "slope": float(slope),
          "window": float(window)})
         
     if filter_csf:
-        pipeline.append(
+        classification_pipeline.append(
         {"type": "filters.csf",
          "resolution": float(cloth_resolution),
          "rigidness": int(rigidness),
          "iterations": int(iterations),
          "step": float(time_step)})
-        
-    pipeline += [
-        {"type": "filters.ferry", "dimensions": "Z=>Elevation"},
+
+    classification_pipeline += [
+        {"type": "writers.las", "filename": classified_out_laz, "compression": "laszip"}
+    ]
+
+    try:
+        pdal.pipeline.Pipeline(json.dumps(classification_pipeline)).execute()
+    except RuntimeError as e:
+        print(f"[INFO] PDAL classification pipeline failed: {e}. No points in chunk.")
+        return None
+
+    _verify_point_cloud_output(classified_out_laz, "Classified chunk LAZ")
+
+    ground_pipeline = [
+        {"type": "readers.las", "filename": classified_out_laz},
         {"type": "filters.range", "limits": "Classification[2:2]"},
-        {"type": "filters.crop", "polygon": wkt_dumps(small_chunk_bbox)},
+        {"type": "writers.las", "filename": ground_out_laz, "compression": "laszip"}
+    ]
+
+    try:
+        pdal.pipeline.Pipeline(json.dumps(ground_pipeline)).execute()
+    except RuntimeError as e:
+        print(f"[INFO] PDAL ground-only pipeline failed: {e}. No ground points in chunk.")
+        return None
+
+    if not _verify_point_cloud_output(ground_out_laz, "Ground-only chunk LAZ"):
+        return None
+
+    pipeline = [
+        {"type": "readers.las", "filename": ground_out_laz},
+        {"type": "filters.ferry", "dimensions": "Z=>Elevation"},
         {"type": "writers.gdal",
          "filename": chunk_file,
          "resolution": float(cloth_resolution),
@@ -170,6 +255,29 @@ def process_chunk_to_dem(input_file, large_chunk_bbox, small_chunk_bbox, temp_di
             return None
 
     return chunk_file
+
+
+def merge_laz_chunks(input_files, output_file):
+    if not input_files:
+        print(f"[WARNING] No LAZ chunk files found to merge for {output_file}")
+        return None
+
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    pipeline = [{"type": "readers.las", "filename": in_file} for in_file in input_files]
+    pipeline.extend([
+        {"type": "filters.merge"},
+        {"type": "writers.las", "filename": output_file, "compression": "laszip"}
+    ])
+
+    try:
+        pdal.pipeline.Pipeline(json.dumps(pipeline)).execute()
+    except RuntimeError as e:
+        print(f"[ERROR] Failed to merge LAZ chunks into {output_file}: {e}")
+        return None
+
+    if _verify_point_cloud_output(output_file, "Merged LAZ"):
+        return output_file
+    return None
 
 def merge_chunks(input_files, output_file):
     """

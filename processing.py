@@ -21,7 +21,7 @@ from multiprocessing import get_context
 import multiprocessing
 from shapely.wkt import loads as wkt_loads, dumps as wkt_dumps
 
-from core.processing_windowed import create_chunks_from_wkt, process_chunk_to_dsm, process_chunk_to_dem ,merge_chunks
+from core.processing_windowed import create_chunks_from_wkt, process_chunk_to_dsm, process_chunk_to_dem_with_laz_outputs, merge_chunks, merge_laz_chunks
 
 
 def check_resolution(las_file, resolution, method="sampling", num_samples=10000):
@@ -170,32 +170,59 @@ def generate_dsm(input_folder, output_folder, run_name, method, resolution, chun
 
 
 def process_dtm_chunk_wrapper(args):
-    (las_file, large_chunk, small_chunk, output_dir, threshold,
-     scalar, slope, window, rigidness, iterations, resolution,
-     time_step, cloth_resolution, fill_gaps, filter_smrf, filter_csf) = args
-    return process_chunk_to_dem(input_file=las_file, large_chunk_bbox=large_chunk, small_chunk_bbox=small_chunk, temp_dir=output_dir, scalar=scalar, threshold=threshold, slope=slope, window=window, rigidness=rigidness, iterations=iterations, resolution=resolution, time_step=time_step, cloth_resolution=cloth_resolution, fill_gaps=fill_gaps, filter_smrf=filter_smrf, filter_csf=filter_csf)
+    (las_file, large_chunk, small_chunk, output_dir, cleaned_chunk_dir,
+     classified_chunk_dir, threshold, scalar, slope, window, rigidness,
+     iterations, resolution, time_step, cloth_resolution, fill_gaps,
+     filter_smrf, filter_csf) = args
+
+    return process_chunk_to_dem_with_laz_outputs(
+        input_file=las_file,
+        large_chunk_bbox=large_chunk,
+        small_chunk_bbox=small_chunk,
+        temp_dir=output_dir,
+        cleaned_chunk_dir=cleaned_chunk_dir,
+        classified_chunk_dir=classified_chunk_dir,
+        scalar=scalar,
+        threshold=threshold,
+        slope=slope,
+        window=window,
+        rigidness=rigidness,
+        iterations=iterations,
+        resolution=resolution,
+        time_step=time_step,
+        cloth_resolution=cloth_resolution,
+        fill_gaps=fill_gaps,
+        filter_smrf=filter_smrf,
+        filter_csf=filter_csf
+    )
+
 
 def generate_dtm(input_folder, output_folder, run_name, resolution, chunk_size, fill_gaps, num_workers, method, chunk_overlap, threshold, scalar, slope, window, rigidness, iterations, time_step, cloth_resolution, filter_smrf, filter_csf):
-    
+
     final_output_folder = os.path.join(output_folder, run_name, 'DTM')
     os.makedirs(final_output_folder, exist_ok=True)
     temp_folder = os.path.join(final_output_folder, "temp")
     os.makedirs(temp_folder, exist_ok=True)
-    
+
     start_time = time.time()
-    las_files = glob.glob(os.path.join(input_folder, run_name, "*.las")) + \
-                glob.glob(os.path.join(input_folder, run_name, "*.laz"))
-    
+    las_files = glob.glob(os.path.join(input_folder, run_name, "*.las")) +                 glob.glob(os.path.join(input_folder, run_name, "*.laz"))
+
     if not las_files:
         print("No LAS/LAZ files found. Exiting DTM generation.")
         return
-    
 
     for las_file in tqdm(las_files, desc="Processing LAS files", unit="file"):
-        
+
         base_name = os.path.splitext(os.path.basename(las_file))[0]
         temp_dtm_dir = os.path.join(temp_folder, base_name)
         final_dtm_path = os.path.join(final_output_folder, f"{base_name}_DTM.tif")
+
+        cleaned_out_dir = os.path.join(output_folder, run_name, "CLEANED_LAZ")
+        cleaned_chunk_dir = os.path.join(cleaned_out_dir, "chunks", base_name)
+        classified_out_dir = os.path.join(output_folder, run_name, "CLASSIFIED_LAZ")
+        classified_chunk_dir = os.path.join(classified_out_dir, "chunks", base_name)
+        os.makedirs(cleaned_chunk_dir, exist_ok=True)
+        os.makedirs(classified_chunk_dir, exist_ok=True)
 
         if not os.path.exists(final_dtm_path):
 
@@ -203,11 +230,9 @@ def generate_dtm(input_folder, output_folder, run_name, resolution, chunk_size, 
             avg_spacing, is_resolution_ok = check_resolution(las_file, resolution, method)
             if not is_resolution_ok:
                 print(f"Warning: DTM resolution ({resolution}m) is finer than avg spacing ({avg_spacing:.3f}m).")
-            
-            base_name = os.path.splitext(os.path.basename(las_file))[0]
-            temp_dtm_dir = os.path.join(temp_folder, base_name)
+
             os.makedirs(temp_dtm_dir, exist_ok=True)
-            
+
             large_chunks, small_chunks = create_chunks_from_wkt(
                 target_wkt,
                 chunk_size=chunk_size,
@@ -215,31 +240,32 @@ def generate_dtm(input_folder, output_folder, run_name, resolution, chunk_size, 
             )
 
             chunk_tasks = []
-            
             for large_chunk, small_chunk in zip(large_chunks, small_chunks):
                 chunk_tasks.append((
                     las_file, large_chunk, small_chunk, temp_dtm_dir,
-                    threshold,      # correct position
-                    scalar,         # correct position
-                    slope, window, rigidness, iterations,
+                    cleaned_chunk_dir, classified_chunk_dir,
+                    threshold, scalar, slope, window, rigidness, iterations,
                     resolution, time_step, cloth_resolution,
                     fill_gaps, filter_smrf, filter_csf
                 ))
 
-        
+            print(f"[DEBUG] {base_name}: DTM n_chunk_tasks={len(chunk_tasks)}")
+            print(f"[DEBUG] {base_name}: cleaned chunks -> {cleaned_chunk_dir}")
+            print(f"[DEBUG] {base_name}: classified chunks -> {classified_chunk_dir}")
+
             with multiprocessing.Pool(processes=num_workers) as pool:
-                    list(tqdm(
-                        pool.imap_unordered(process_dtm_chunk_wrapper, chunk_tasks),
-                        total=len(chunk_tasks),
-                        desc="Processing DTM Chunks"))
-            
+                list(tqdm(
+                    pool.imap_unordered(process_dtm_chunk_wrapper, chunk_tasks),
+                    total=len(chunk_tasks),
+                    desc="Processing DTM Chunks"))
+
             chunk_files = sorted(glob.glob(os.path.join(temp_dtm_dir, "*.tif")))
             if not chunk_files:
                 print(f"No DTM chunks found for {base_name}. Skipping.")
                 continue
-            
+
             merged_dtm = merge_chunks(chunk_files, final_dtm_path)
-            
+
             if fill_gaps and merged_dtm:
                 filled_dtm_path = os.path.join(temp_dtm_dir, f"{base_name}_filled.tif")
                 subprocess.run(
@@ -250,27 +276,47 @@ def generate_dtm(input_folder, output_folder, run_name, resolution, chunk_size, 
                 )
                 os.replace(filled_dtm_path, final_dtm_path)
 
+            cleaned_chunk_files = sorted(glob.glob(os.path.join(cleaned_chunk_dir, "*_cleaned.laz")))
+            classified_chunk_files = sorted(glob.glob(os.path.join(classified_chunk_dir, "*_classified.laz")))
+            ground_chunk_files = sorted(glob.glob(os.path.join(classified_chunk_dir, "*_ground.laz")))
+
+            print(f"[DEBUG] {base_name}: cleaned/classified/ground chunk files = "
+                  f"{len(cleaned_chunk_files)}/{len(classified_chunk_files)}/{len(ground_chunk_files)}")
+
+            ground_merged_path = os.path.join(classified_out_dir, f"{base_name}_ground_merged.laz")
+            merge_laz_chunks(cleaned_chunk_files, os.path.join(cleaned_out_dir, f"{base_name}_cleaned_merged.laz"))
+            merge_laz_chunks(classified_chunk_files, os.path.join(classified_out_dir, f"{base_name}_classified_merged.laz"))
+            merge_laz_chunks(ground_chunk_files, ground_merged_path)
+
+            if os.path.exists(ground_merged_path) and os.path.getsize(ground_merged_path) > 0:
+                try:
+                    with laspy.open(ground_merged_path) as ground_las:
+                        ground_points = ground_las.read()
+                        unique_classes = np.unique(ground_points.classification)
+                    if len(unique_classes) > 0 and not np.all(unique_classes == 2):
+                        print(f"[WARNING] Ground merged file has non-ground classes: {unique_classes}")
+                except Exception as exc:
+                    print(f"[WARNING] Could not validate ground classes for {ground_merged_path}: {exc}")
+
             with rasterio.open(final_dtm_path) as src:
                 dtm_data = src.read(1)
                 dtm_nodata = src.nodata if src.nodata is not None else np.nan
                 dtm_data = np.where(dtm_data == dtm_nodata, np.nan, dtm_data)
 
-            # Plot the merged DSM and save as PNG
             plt.figure(figsize=(10, 10))
             plt.imshow(dtm_data, cmap='terrain', vmin=np.nanpercentile(dtm_data, 2), vmax=np.nanpercentile(dtm_data, 98))
             plt.colorbar(label='Elevation (m)')
             plt.title(f'DTM: {base_name}')
             plt.axis('off')
             plt.savefig(os.path.join(final_output_folder, f"{base_name}_DTM.png"), bbox_inches='tight', pad_inches=0.1)
-            plt.close()  # Ensure we close the plot to free memory
+            plt.close()
 
-            shutil.rmtree(temp_dtm_dir, ignore_errors=True)
-            
+            # keep temp rasters for debugging
+            # shutil.rmtree(temp_dtm_dir, ignore_errors=True)
+
         else:
             print(f"Skipping {base_name}: DTM already exists.")
-        
-        
-    
+
     elapsed_time = timedelta(seconds=int(time.time() - start_time))
     print(f"\nDTM generation completed in {elapsed_time}.")
 
