@@ -12,6 +12,47 @@ import subprocess
 from shapely.geometry import box, shape
 from shapely.wkt import loads as wkt_loads, dumps as wkt_dumps
 
+
+def fill_nodata_raster_inplace(raster_path, max_distance=10, smoothing_iterations=2):
+    """Fill nodata in-place using GDAL API (cross-platform, avoids shelling out)."""
+    ds = gdal.Open(raster_path, gdal.GA_Update)
+    if ds is None:
+        raise RuntimeError(f"Could not open raster for update: {raster_path}")
+
+    band = ds.GetRasterBand(1)
+    if band is None:
+        ds = None
+        raise RuntimeError(f"Could not open band 1 in raster: {raster_path}")
+
+    mask_band = band.GetMaskBand()
+    gdal.FillNodata(
+        targetBand=band,
+        maskBand=mask_band,
+        maxSearchDist=float(max_distance),
+        smoothingIterations=int(smoothing_iterations)
+    )
+    band.FlushCache()
+    ds.FlushCache()
+    ds = None
+
+
+def warp_raster_to_bounds(src_path, dst_path, resolution, bounds, resample_alg="bilinear"):
+    """Warp raster with target resolution/alignment using GDAL API."""
+    minx, miny, maxx, maxy = bounds
+    options = gdal.WarpOptions(
+        xRes=float(resolution),
+        yRes=float(resolution),
+        resampleAlg=resample_alg,
+        targetAlignedPixels=True,
+        outputBounds=(minx, miny, maxx, maxy),
+        multithread=True
+    )
+    out_ds = gdal.Warp(dst_path, src_path, options=options)
+    if out_ds is None:
+        raise RuntimeError(f"gdal.Warp failed for {src_path}")
+    out_ds.FlushCache()
+    out_ds = None
+
 def create_chunks_from_wkt(input_wkt, chunk_size=1000, overlap=0.2):
     """
     create processing chunks based on wkt geometry of target area, with overlap enlarged by x percent, 
@@ -76,50 +117,128 @@ def process_chunk_to_dsm(input_file, large_chunk_bbox, small_chunk_bbox, temp_di
 
 
     try:
-        subprocess.run([
-            "gdal_fillnodata.py",
-            "-md", "10",
-            "-si", "2",
-            chunk_file,
-            chunk_file
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        #print("[INFO] Nodata gaps filled with GDAL.")
-    except subprocess.CalledProcessError as e:
+        fill_nodata_raster_inplace(chunk_file, max_distance=10, smoothing_iterations=2)
+    except Exception as e:
         print(f"[ERROR] GDAL fillnodata failed: {e}")
 
     return chunk_file
 
 def process_chunk_to_dem(input_file, large_chunk_bbox, small_chunk_bbox, temp_dir, rigidness, iterations, resolution, time_step, cloth_resolution=1, fill_gaps=True, filter_smrf=False, scalar=None, slope=None, window=None, threshold=None, filter_csf=False):
 
+    return process_chunk_to_dem_with_laz_outputs(
+        input_file=input_file,
+        large_chunk_bbox=large_chunk_bbox,
+        small_chunk_bbox=small_chunk_bbox,
+        temp_dir=temp_dir,
+        cleaned_chunk_dir=temp_dir,
+        classified_chunk_dir=temp_dir,
+        rigidness=rigidness,
+        iterations=iterations,
+        resolution=resolution,
+        time_step=time_step,
+        cloth_resolution=cloth_resolution,
+        fill_gaps=fill_gaps,
+        filter_smrf=filter_smrf,
+        scalar=scalar,
+        slope=slope,
+        window=window,
+        threshold=threshold,
+        filter_csf=filter_csf,
+        save_cleaned_laz=False
+    )
+
+
+def _verify_point_cloud_output(path, label):
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return True
+    print(f"[WARNING] {label} was not written or is empty: {path}")
+    return False
+
+
+def process_chunk_to_dem_with_laz_outputs(input_file, large_chunk_bbox, small_chunk_bbox, temp_dir, cleaned_chunk_dir, classified_chunk_dir, rigidness, iterations, resolution, time_step, cloth_resolution=1, fill_gaps=True, filter_smrf=False, scalar=None, slope=None, window=None, threshold=None, filter_csf=False, save_cleaned_laz=True):
+
     chunk_file = os.path.join(
         temp_dir,
         f"{os.path.basename(input_file).replace('.las', '')}_chunk_{int(small_chunk_bbox.bounds[0])}_{int(small_chunk_bbox.bounds[1])}.tif"
     )
 
-    pipeline = [
+    os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(cleaned_chunk_dir, exist_ok=True)
+    os.makedirs(classified_chunk_dir, exist_ok=True)
+
+    base_name = os.path.basename(input_file).replace('.las', '').replace('.laz', '')
+    chunk_id = f"{int(small_chunk_bbox.bounds[0])}_{int(small_chunk_bbox.bounds[1])}"
+    cleaned_out_laz = os.path.join(cleaned_chunk_dir, f"{base_name}_chunk_{chunk_id}_cleaned.laz")
+    classified_out_laz = os.path.join(classified_chunk_dir, f"{base_name}_chunk_{chunk_id}_classified.laz")
+    ground_out_laz = os.path.join(classified_chunk_dir, f"{base_name}_chunk_{chunk_id}_ground.laz")
+
+    print(f"[DEBUG] Chunk {chunk_id} outputs: cleaned={cleaned_out_laz}, classified={classified_out_laz}, ground={ground_out_laz}")
+
+    cleaning_pipeline = [
         {"type": "readers.las", "filename": input_file},
         {"type": "filters.crop", "polygon": wkt_dumps(large_chunk_bbox)},
-
+        {"type": "filters.crop", "polygon": wkt_dumps(small_chunk_bbox)},
+        {"type": "writers.las", "filename": cleaned_out_laz, "compression": "laszip"}
     ]
+
+    try:
+        pdal.pipeline.Pipeline(json.dumps(cleaning_pipeline)).execute()
+    except RuntimeError as e:
+        print(f"[INFO] PDAL cleaned chunk pipeline failed: {e}. No points in chunk.")
+        return None
+
+    if save_cleaned_laz:
+        _verify_point_cloud_output(cleaned_out_laz, "Cleaned chunk LAZ")
+
+    classification_pipeline = [
+        {"type": "readers.las", "filename": cleaned_out_laz},
+    ]
+
     if filter_smrf:
 
-        pipeline.append({"type": "filters.smrf",
+        classification_pipeline.append({"type": "filters.smrf",
          "scalar": float(scalar),
          "slope": float(slope),
          "window": float(window)})
         
     if filter_csf:
-        pipeline.append(
+        classification_pipeline.append(
         {"type": "filters.csf",
          "resolution": float(cloth_resolution),
          "rigidness": int(rigidness),
          "iterations": int(iterations),
          "step": float(time_step)})
-        
-    pipeline += [
-        {"type": "filters.ferry", "dimensions": "Z=>Elevation"},
+
+    classification_pipeline += [
+        {"type": "writers.las", "filename": classified_out_laz, "compression": "laszip"}
+    ]
+
+    try:
+        pdal.pipeline.Pipeline(json.dumps(classification_pipeline)).execute()
+    except RuntimeError as e:
+        print(f"[INFO] PDAL classification pipeline failed: {e}. No points in chunk.")
+        return None
+
+    _verify_point_cloud_output(classified_out_laz, "Classified chunk LAZ")
+
+    ground_pipeline = [
+        {"type": "readers.las", "filename": classified_out_laz},
         {"type": "filters.range", "limits": "Classification[2:2]"},
-        {"type": "filters.crop", "polygon": wkt_dumps(small_chunk_bbox)},
+        {"type": "writers.las", "filename": ground_out_laz, "compression": "laszip"}
+    ]
+
+    try:
+        pdal.pipeline.Pipeline(json.dumps(ground_pipeline)).execute()
+    except RuntimeError as e:
+        print(f"[INFO] PDAL ground-only pipeline failed: {e}. No ground points in chunk.")
+        return None
+
+    if not _verify_point_cloud_output(ground_out_laz, "Ground-only chunk LAZ"):
+        return None
+
+    pipeline = [
+        {"type": "readers.las", "filename": ground_out_laz},
+        {"type": "filters.ferry", "dimensions": "Z=>Elevation"},
         {"type": "writers.gdal",
          "filename": chunk_file,
          "resolution": float(cloth_resolution),
@@ -138,38 +257,50 @@ def process_chunk_to_dem(input_file, large_chunk_bbox, small_chunk_bbox, temp_di
     minx, miny, maxx, maxy = small_chunk_bbox.bounds
 
     try:
-        subprocess.run([
-            "gdalwarp",
-            "-tr", str(resolution), str(resolution),
-            "-r", "bilinear",
-            "-tap",
-            "-te", str(minx), str(miny), str(maxx), str(maxy),
-            "-overwrite",
-            chunk_file,
-            resampled_file
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
+        warp_raster_to_bounds(
+            src_path=chunk_file,
+            dst_path=resampled_file,
+            resolution=resolution,
+            bounds=(minx, miny, maxx, maxy),
+            resample_alg="bilinear"
+        )
         shutil.move(resampled_file, chunk_file)
 
-    except subprocess.CalledProcessError as e:
-        print("[ERROR] gdalwarp failed:")
-        print(e.stderr.decode('utf-8'))
+    except Exception as e:
+        print(f"[ERROR] gdalwarp failed: {e}")
         return None
 
     if fill_gaps:
         try:
-            subprocess.run([
-                "gdal_fillnodata.py",
-                "-md", "100",
-                "-si", "2",
-                chunk_file,
-                chunk_file
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError as e:
+            fill_nodata_raster_inplace(chunk_file, max_distance=100, smoothing_iterations=2)
+        except Exception as e:
             print(f"[ERROR] GDAL fillnodata failed: {e}")
             return None
 
     return chunk_file
+
+
+def merge_laz_chunks(input_files, output_file):
+    if not input_files:
+        print(f"[WARNING] No LAZ chunk files found to merge for {output_file}")
+        return None
+
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    pipeline = [{"type": "readers.las", "filename": in_file} for in_file in input_files]
+    pipeline.extend([
+        {"type": "filters.merge"},
+        {"type": "writers.las", "filename": output_file, "compression": "laszip"}
+    ])
+
+    try:
+        pdal.pipeline.Pipeline(json.dumps(pipeline)).execute()
+    except RuntimeError as e:
+        print(f"[ERROR] Failed to merge LAZ chunks into {output_file}: {e}")
+        return None
+
+    if _verify_point_cloud_output(output_file, "Merged LAZ"):
+        return output_file
+    return None
 
 def merge_chunks(input_files, output_file):
     """

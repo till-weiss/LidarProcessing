@@ -91,6 +91,18 @@ class Configuration:
         self.chunk_overlap = 0.1 # Overlap between chunks in percentage, 0.2 means 20% overlap
         self.num_workers = 16  # Number of parallel workers for processing
 
+        # _______ Strip-level ICP alignment _______
+        self.enable_strip_icp = False  # Enable incremental ICP on strip-level ground merged LAZ before AOI-level merge
+        self.icp_voxel_size = 1.0  # Voxel size (m) for ICP downsampling
+        self.icp_max_corr_dist = 2.0  # Maximum correspondence distance (m) for ICP
+        self.icp_max_iters = 80  # Maximum ICP iterations
+        self.icp_overlap_buffer_m = 10.0  # Buffer around overlap bbox (m) used for ICP subsets
+        self.icp_min_fitness = 0.30  # Minimum ICP fitness to accept transform
+        self.icp_max_abs_dz = 1.00  # Maximum absolute dz shift (m) to accept transform
+        self.icp_max_rotation_deg = 1.00  # Maximum rotation angle (degrees) to accept transform
+        self.icp_fail_policy = "merge_without_icp"  # One of: merge_without_icp, skip_strip, raise
+        self.icp_use_overlap_crop = True  # If True, run ICP on overlap-only cropped subsets
+
         # Set overall GDAL settings
         gdal.UseExceptions()  # Enable exceptions instead of silent failures
         gdal.SetCacheMax(32000000000)  # Set cache size in KB for GDAL operations
