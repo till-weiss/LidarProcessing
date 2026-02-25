@@ -6,12 +6,15 @@ import pdal
 import laspy
 import numpy as np
 import subprocess
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from tqdm import tqdm
 from scipy.spatial import KDTree
 import rasterio
 import signal
 import functools
+import hashlib
+import uuid
+import socket
 import shutil 
 from matplotlib import pyplot as plt
 from rasterio.warp import reproject, Resampling
@@ -31,7 +34,10 @@ from core.icp_alignment import (
     merge_two_laz_with_pdal,
     metrics_from_T,
     write_icp_report_txt,
-    append_json_ledger,
+    extract_las_crs_info,
+    compute_crop_diagnostics,
+    append_jsonl_record,
+    get_open3d_info,
 )
 from pathlib import Path
 
@@ -434,12 +440,33 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
 
     aligned_dir = out_root / run_name / "ICP_GROUND_ALIGNED"
     ref_dir = out_root / run_name / "ICP_GROUND_REF"
-    reports_dir = out_root / run_name / "ICP_REPORTS"
+    reports_dir = out_root / run_name / "ICP_REPORT"
     tmp_dir = reports_dir / "tmp"
     for d in [aligned_dir, ref_dir, reports_dir, tmp_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    ledger_path = reports_dir / "icp_transforms.json"
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"_{uuid.uuid4().hex[:8]}"
+    jsonl_path = reports_dir / f"icp_attempts_{run_id}.jsonl"
+
+    params = {
+        "voxel_size": config.icp_voxel_size,
+        "max_dist": config.icp_max_corr_dist,
+        "max_iters": config.icp_max_iters,
+        "overlap_buffer_m": config.icp_overlap_buffer_m,
+        "min_fitness": config.icp_min_fitness,
+        "max_abs_dz": config.icp_max_abs_dz,
+        "max_rotation_deg": config.icp_max_rotation_deg,
+        "fail_policy": config.icp_fail_policy,
+        "strict_crs_check": getattr(config, "strict_crs_check", True),
+        "min_points": getattr(config, "min_points", 500),
+        "max_pre_dxy": getattr(config, "max_pre_dxy", 100.0),
+        "max_pre_dz": getattr(config, "max_pre_dz", 5.0),
+    }
+    config_hash = hashlib.sha256(json.dumps(params, sort_keys=True).encode("utf-8")).hexdigest()
+
+    o3d_info = get_open3d_info()
+    if getattr(config, "debug_mode", False) and not o3d_info["open3d_available"]:
+        raise RuntimeError("Open3D is unavailable and debug_mode=True; aborting ICP.")
 
     accumulated_ref = ref_dir / "ref_1.laz"
     shutil.copy2(ground_strip_paths[0], accumulated_ref)
@@ -447,20 +474,63 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
     aligned_strips = [accumulated_ref]
     ref_steps = [accumulated_ref]
 
+    attempt_counter = 0
     for idx, src in enumerate(ground_strip_paths[1:], start=2):
+        attempt_counter += 1
         step_id = idx
         t0 = time.time()
+        attempt = {
+            "run_id": run_id,
+            "attempt_id": f"{step_id}_{uuid.uuid4().hex}",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "hostname": socket.gethostname(),
+            "sys.executable": sys.executable,
+            "python_version": sys.version,
+            "open3d_available": o3d_info["open3d_available"],
+            "open3d_version": o3d_info["open3d_version"],
+            "config_hash": config_hash,
+            "ref_path": str(accumulated_ref),
+            "src_path": str(src),
+            "overlap_bbox": None,
+            "crs": {},
+            "accepted": False,
+            "rejected_by": [],
+            "fail_policy_applied": None,
+            "used_moving_for_merge": None,
+        }
+
         overlap_bbox = compute_overlap_bbox_from_headers(accumulated_ref, src, config.icp_overlap_buffer_m)
-        reg = None
-        T = np.eye(4)
-        accepted = False
-        reason = None
-        moving_for_merge = src
+        attempt["overlap_bbox"] = overlap_bbox
+
+        ref_crs = extract_las_crs_info(accumulated_ref)
+        src_crs = extract_las_crs_info(src)
+        attempt["crs"] = {"ref": ref_crs, "src": src_crs}
 
         if overlap_bbox is None:
-            accepted = False
-            reason = "no_overlap"
-        else:
+            attempt["rejected_by"].append("precheck_fail:no_overlap")
+
+        # strict CRS gate
+        if getattr(config, "strict_crs_check", True):
+            ref_present = ref_crs.get("present")
+            src_present = src_crs.get("present")
+            if ref_present != src_present:
+                attempt["rejected_by"].append("precheck_fail:missing_crs")
+            if ref_present and src_present:
+                ref_epsg = ref_crs.get("epsg") or ref_crs.get("horizontal")
+                src_epsg = src_crs.get("epsg") or src_crs.get("horizontal")
+                if ref_epsg != src_epsg:
+                    attempt["rejected_by"].append("precheck_fail:crs_mismatch")
+                ref_units = tuple(ref_crs.get("units") or [])
+                src_units = tuple(src_crs.get("units") or [])
+                if ref_units != src_units:
+                    attempt["rejected_by"].append("precheck_fail:unit_mismatch")
+
+        reg = None
+        T = np.eye(4)
+        moving_for_merge = src
+        diag = {}
+
+        if not attempt["rejected_by"] and overlap_bbox is not None:
             try:
                 ref_for_icp = accumulated_ref
                 src_for_icp = src
@@ -470,53 +540,88 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
                     crop_bbox_with_pdal(accumulated_ref, ref_for_icp, overlap_bbox)
                     crop_bbox_with_pdal(src, src_for_icp, overlap_bbox)
 
-                reg, T = run_icp(
-                    source_xyz=read_xyz_laspy(src_for_icp),
-                    target_xyz=read_xyz_laspy(ref_for_icp),
-                    voxel_size=config.icp_voxel_size,
-                    max_dist=config.icp_max_corr_dist,
-                    max_iters=config.icp_max_iters,
-                )
-                metrics = metrics_from_T(T)
-                checks = []
-                if reg.fitness < config.icp_min_fitness:
-                    checks.append(f"fitness<{config.icp_min_fitness}")
-                if abs(metrics["dz"]) > config.icp_max_abs_dz:
-                    checks.append(f"abs(dz)>{config.icp_max_abs_dz}")
-                if metrics["rotation_deg"] > config.icp_max_rotation_deg:
-                    checks.append(f"rotation>{config.icp_max_rotation_deg}")
+                xyz_ref = read_xyz_laspy(ref_for_icp)
+                xyz_src = read_xyz_laspy(src_for_icp)
+                diag = compute_crop_diagnostics(xyz_ref, xyz_src)
+                attempt.update(diag)
 
-                if checks:
-                    accepted = False
-                    reason = "threshold_fail:" + ",".join(checks)
-                else:
-                    accepted = True
-                    aligned_src = aligned_dir / f"{src.stem}_icp.laz"
-                    apply_transformation_with_pdal(src, aligned_src, T)
-                    moving_for_merge = aligned_src
-                    aligned_strips.append(aligned_src)
+                if diag["n_ref_crop"] < config.min_points or diag["n_src_crop"] < config.min_points:
+                    attempt["rejected_by"].append("precheck_fail:empty_or_sparse_overlap")
+                if diag.get("dxy_centroid_pre") is not None and diag["dxy_centroid_pre"] > config.max_pre_dxy:
+                    attempt["rejected_by"].append("precheck_fail:max_pre_dxy")
+                if diag.get("dz_median_pre") is not None and abs(diag["dz_median_pre"]) > config.max_pre_dz:
+                    attempt["rejected_by"].append("precheck_fail:max_pre_dz")
+
+                if not attempt["rejected_by"]:
+                    reg, T = run_icp(
+                        source_xyz=xyz_src,
+                        target_xyz=xyz_ref,
+                        voxel_size=config.icp_voxel_size,
+                        max_dist=config.icp_max_corr_dist,
+                        max_iters=config.icp_max_iters,
+                    )
+                    metrics = metrics_from_T(T)
+                    attempt.update({
+                        "fitness": float(reg.fitness),
+                        "inlier_rmse": float(reg.inlier_rmse),
+                        "dx": metrics["dx"],
+                        "dy": metrics["dy"],
+                        "dz": metrics["dz"],
+                        "rotation_deg": metrics["rotation_deg"],
+                        "transform_matrix": [[float(v) for v in row] for row in T.tolist()],
+                    })
+                    post_dz = None
+                    if diag.get("dz_median_pre") is not None:
+                        post_dz = abs(diag["dz_median_pre"] - metrics["dz"])
+                    attempt["dz_median_post"] = post_dz
+
+                    if reg.fitness < config.icp_min_fitness:
+                        attempt["rejected_by"].append("min_fitness")
+                    if abs(metrics["dz"]) > config.icp_max_abs_dz:
+                        attempt["rejected_by"].append("max_abs_dz")
+                    if metrics["rotation_deg"] > config.icp_max_rotation_deg:
+                        attempt["rejected_by"].append("max_rotation_deg")
+
+                    if not attempt["rejected_by"]:
+                        aligned_src = aligned_dir / f"{src.stem}_icp.laz"
+                        apply_transformation_with_pdal(src, aligned_src, T)
+                        moving_for_merge = aligned_src
+                        aligned_strips.append(aligned_src)
+                        attempt["accepted"] = True
             except Exception as exc:
-                accepted = False
-                reason = f"icp_error:{exc}"
+                attempt["rejected_by"].append(f"icp_error:{exc}")
 
-        if not accepted:
+        if not attempt["accepted"]:
+            if getattr(config, "debug_mode", False):
+                attempt["fail_policy_applied"] = "raise(debug_mode)"
+                attempt["runtime_sec"] = time.time() - t0
+                append_jsonl_record(jsonl_path, attempt)
+                raise RuntimeError(f"ICP step {step_id} failed in debug_mode: {attempt['rejected_by']}")
+
             if config.icp_fail_policy == "raise":
-                raise RuntimeError(f"ICP step {step_id} failed: {reason}")
+                attempt["fail_policy_applied"] = "raise"
+                attempt["runtime_sec"] = time.time() - t0
+                append_jsonl_record(jsonl_path, attempt)
+                raise RuntimeError(f"ICP step {step_id} failed: {attempt['rejected_by']}")
             if config.icp_fail_policy == "skip_strip":
-                record = {
-                    "step": step_id, "ref_in": str(accumulated_ref), "src_in": str(src),
-                    "overlap_bbox": overlap_bbox, "accepted": False, "reason": reason,
-                    "runtime_sec": time.time() - t0
-                }
-                append_json_ledger(ledger_path, record)
+                attempt["fail_policy_applied"] = "skip_strip"
+                attempt["runtime_sec"] = time.time() - t0
+                append_jsonl_record(jsonl_path, attempt)
                 write_icp_report_txt(
                     report_path=reports_dir / f"icp_step_{step_id}.txt",
-                    step_id=step_id, ref_path=accumulated_ref, src_path=src,
-                    params={"fail_policy": config.icp_fail_policy},
-                    reg=reg, T=T, runtime_sec=time.time() - t0,
-                    accepted=False, reason=reason, overlap_bbox=overlap_bbox
+                    step_id=step_id,
+                    ref_path=accumulated_ref,
+                    src_path=src,
+                    params=params,
+                    reg=reg,
+                    T=T,
+                    runtime_sec=time.time() - t0,
+                    accepted=False,
+                    reason=", ".join(attempt["rejected_by"]),
+                    overlap_bbox=overlap_bbox,
                 )
                 continue
+            attempt["fail_policy_applied"] = "merge_without_icp"
             moving_for_merge = src
 
         out_ref = ref_dir / f"ref_1to{step_id}.laz"
@@ -524,40 +629,23 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
         accumulated_ref = out_ref
         ref_steps.append(out_ref)
 
-        reg_fitness = getattr(reg, "fitness", None)
-        reg_rmse = getattr(reg, "inlier_rmse", None)
-        m = metrics_from_T(T)
-        record = {
-            "step": step_id,
-            "ref_in": str(ref_steps[-2]),
-            "src_in": str(src),
-            "overlap_bbox": overlap_bbox,
-            "accepted": accepted,
-            "reason": reason,
-            "fitness": reg_fitness,
-            "inlier_rmse": reg_rmse,
-            "dx": m["dx"], "dy": m["dy"], "dz": m["dz"], "rotation_deg": m["rotation_deg"],
-            "T_flat": [float(v) for v in T.reshape(-1)],
-            "runtime_sec": time.time() - t0,
-            "used_moving_for_merge": str(moving_for_merge),
-            "out_ref": str(out_ref),
-        }
-        append_json_ledger(ledger_path, record)
+        attempt["used_moving_for_merge"] = str(moving_for_merge)
+        attempt["out_ref"] = str(out_ref)
+        attempt["runtime_sec"] = time.time() - t0
+        append_jsonl_record(jsonl_path, attempt)
+
         write_icp_report_txt(
             report_path=reports_dir / f"icp_step_{step_id}.txt",
-            step_id=step_id, ref_path=ref_steps[-2], src_path=src,
-            params={
-                "voxel_size": config.icp_voxel_size,
-                "max_dist": config.icp_max_corr_dist,
-                "max_iters": config.icp_max_iters,
-                "overlap_buffer_m": config.icp_overlap_buffer_m,
-                "min_fitness": config.icp_min_fitness,
-                "max_abs_dz": config.icp_max_abs_dz,
-                "max_rotation_deg": config.icp_max_rotation_deg,
-                "fail_policy": config.icp_fail_policy,
-            },
-            reg=reg, T=T, runtime_sec=time.time() - t0,
-            accepted=accepted, reason=reason, overlap_bbox=overlap_bbox
+            step_id=step_id,
+            ref_path=ref_steps[-2],
+            src_path=src,
+            params=params,
+            reg=reg,
+            T=T,
+            runtime_sec=attempt["runtime_sec"],
+            accepted=attempt["accepted"],
+            reason=", ".join(attempt["rejected_by"]) if attempt["rejected_by"] else None,
+            overlap_bbox=overlap_bbox,
         )
 
     return {
@@ -565,7 +653,8 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
         "ref_steps": ref_steps,
         "final_ref": accumulated_ref,
         "reports_dir": reports_dir,
-        "ledger_path": ledger_path,
+        "ledger_path": jsonl_path,
+        "run_id": run_id,
     }
 
 def process_all(config):

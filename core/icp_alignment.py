@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import shutil
+import socket
+import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -15,7 +16,7 @@ import pdal
 
 try:
     import open3d as o3d
-except Exception:  # pragma: no cover - runtime environment dependent
+except Exception:  # pragma: no cover
     o3d = None
 
 
@@ -166,6 +167,104 @@ def append_json_ledger(ledger_path: Path, record: dict) -> None:
         payload = []
     payload.append(record)
     ledger_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def append_jsonl_record(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def get_open3d_info() -> dict:
+    available = o3d is not None
+    version = getattr(o3d, "__version__", None) if available else None
+    return {"open3d_available": available, "open3d_version": version}
+
+
+def _crs_to_dict(crs) -> dict:
+    if crs is None:
+        return {"present": False, "epsg": None, "wkt": None, "horizontal": None, "vertical": None, "units": None}
+    epsg = None
+    try:
+        epsg = crs.to_epsg()
+    except Exception:
+        epsg = None
+    axis_units = []
+    try:
+        axis_units = [a.unit_name for a in crs.axis_info] if crs.axis_info else []
+    except Exception:
+        axis_units = []
+    horizontal = None
+    vertical = None
+    try:
+        horizontal = crs.source_crs.to_wkt() if getattr(crs, "source_crs", None) else crs.to_wkt()
+    except Exception:
+        horizontal = None
+    try:
+        vertical = crs.target_crs.to_wkt() if getattr(crs, "target_crs", None) else None
+    except Exception:
+        vertical = None
+    wkt = None
+    try:
+        wkt = crs.to_wkt()
+    except Exception:
+        wkt = None
+    return {
+        "present": True,
+        "epsg": epsg,
+        "wkt": wkt,
+        "horizontal": horizontal,
+        "vertical": vertical,
+        "units": axis_units,
+    }
+
+
+def extract_las_crs_info(laz_path: Path) -> dict:
+    with laspy.open(str(laz_path)) as f:
+        crs = None
+        try:
+            crs = f.header.parse_crs()
+        except Exception:
+            crs = None
+    return _crs_to_dict(crs)
+
+
+def compute_crop_diagnostics(xyz_ref: np.ndarray, xyz_src: np.ndarray) -> dict:
+    def _bounds(x):
+        return {
+            "min": x.min(axis=0).tolist() if len(x) else None,
+            "max": x.max(axis=0).tolist() if len(x) else None,
+        }
+    centroid_ref = np.median(xyz_ref[:, :2], axis=0) if len(xyz_ref) else np.array([np.nan, np.nan])
+    centroid_src = np.median(xyz_src[:, :2], axis=0) if len(xyz_src) else np.array([np.nan, np.nan])
+    dxy = float(np.linalg.norm(centroid_ref - centroid_src)) if len(xyz_ref) and len(xyz_src) else None
+    medz_ref = float(np.median(xyz_ref[:, 2])) if len(xyz_ref) else None
+    medz_src = float(np.median(xyz_src[:, 2])) if len(xyz_src) else None
+    dz = (medz_src - medz_ref) if (medz_ref is not None and medz_src is not None) else None
+    return {
+        "n_ref_crop": int(len(xyz_ref)),
+        "n_src_crop": int(len(xyz_src)),
+        "bounds_ref_crop": _bounds(xyz_ref),
+        "bounds_src_crop": _bounds(xyz_src),
+        "centroid_ref_crop": np.mean(xyz_ref, axis=0).tolist() if len(xyz_ref) else None,
+        "centroid_src_crop": np.mean(xyz_src, axis=0).tolist() if len(xyz_src) else None,
+        "median_z_ref_crop": medz_ref,
+        "median_z_src_crop": medz_src,
+        "dxy_centroid_pre": dxy,
+        "dz_median_pre": dz,
+    }
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def host_info() -> dict:
+    return {
+        "hostname": socket.gethostname(),
+        "sys_executable": sys.executable,
+        "python_version": sys.version,
+    }
 
 
 def _main():
