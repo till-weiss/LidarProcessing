@@ -5,3 +5,20 @@
 # Python cache
 __pycache__/
 *.pyc
+<<<<<<< HEAD
+=======
+*.pyo
+*.pyd
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Pixi
+.pixi/
+>>>>>>> 03c3961 (Stop tracking pycache files)
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
