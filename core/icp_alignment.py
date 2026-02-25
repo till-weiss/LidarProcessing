@@ -283,6 +283,40 @@ def compute_crop_diagnostics(xyz_ref: np.ndarray, xyz_src: np.ndarray) -> dict:
     }
 
 
+def bounds_xy_from_xyz(xyz: np.ndarray) -> Optional[tuple[float, float, float, float]]:
+    if xyz.size == 0:
+        return None
+    return (
+        float(np.min(xyz[:, 0])),
+        float(np.min(xyz[:, 1])),
+        float(np.max(xyz[:, 0])),
+        float(np.max(xyz[:, 1])),
+    )
+
+
+def intersect_bboxes(b1: tuple[float, float, float, float], b2: tuple[float, float, float, float]) -> Optional[tuple[float, float, float, float]]:
+    xmin = max(float(b1[0]), float(b2[0]))
+    ymin = max(float(b1[1]), float(b2[1]))
+    xmax = min(float(b1[2]), float(b2[2]))
+    ymax = min(float(b1[3]), float(b2[3]))
+    if xmin >= xmax or ymin >= ymax:
+        return None
+    return (xmin, ymin, xmax, ymax)
+
+
+def buffer_bbox_inward(bbox: tuple[float, float, float, float], buffer_m: float) -> Optional[tuple[float, float, float, float]]:
+    b = float(buffer_m)
+    xmin, ymin, xmax, ymax = bbox
+    out = (xmin + b, ymin + b, xmax - b, ymax - b)
+    if out[0] >= out[2] or out[1] >= out[3]:
+        return None
+    return out
+
+
+def bbox_area_m2(bbox: tuple[float, float, float, float]) -> float:
+    return float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
