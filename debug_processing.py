@@ -17,8 +17,9 @@ from shapely.geometry import box
 from core.processing_windowed import (
     create_chunks_from_wkt,
     process_chunk_to_dsm,
-    process_chunk_to_dem,
-    merge_chunks
+    process_chunk_to_dem_with_laz_outputs,
+    merge_chunks,
+    merge_laz_chunks, fill_nodata_raster_inplace
 )
 
 
@@ -169,11 +170,12 @@ def generate_dsm(
 
         if fill_gaps and merged_dsm:
             filled_dsm_path = os.path.join(temp_dsm_dir, f"{base_name}_filled.tif")
-            subprocess.run(
-                ["gdal_fillnodata.py", "-md", "10", "-si", "2", merged_dsm, filled_dsm_path],
-                check=True
-            )
-            os.replace(filled_dsm_path, final_dsm_path)
+            try:
+                shutil.copy2(merged_dsm, filled_dsm_path)
+                fill_nodata_raster_inplace(filled_dsm_path, max_distance=10, smoothing_iterations=2)
+                os.replace(filled_dsm_path, final_dsm_path)
+            except Exception as exc:
+                print(f"[WARNING] DSM fill_nodata failed, using unfilled raster: {exc}")
 
         # --- quick plot ---
         with rasterio.open(final_dsm_path) as src:
@@ -206,16 +208,19 @@ def process_dtm_chunk_wrapper(args):
     """
     DEBUG-friendly: don't swallow exceptions.
     """
-    (las_file, large_chunk, small_chunk, output_dir, threshold,
-     scalar, slope, window, rigidness, iterations, resolution,
-     time_step, cloth_resolution, fill_gaps, filter_smrf, filter_csf) = args
+    (las_file, large_chunk, small_chunk, output_dir, cleaned_chunk_dir,
+     classified_chunk_dir, threshold, scalar, slope, window, rigidness,
+     iterations, resolution, time_step, cloth_resolution, fill_gaps,
+     filter_smrf, filter_csf) = args
 
     try:
-        return process_chunk_to_dem(
+        return process_chunk_to_dem_with_laz_outputs(
             input_file=las_file,
             large_chunk_bbox=large_chunk,
             small_chunk_bbox=small_chunk,
             temp_dir=output_dir,
+            cleaned_chunk_dir=cleaned_chunk_dir,
+            classified_chunk_dir=classified_chunk_dir,
             scalar=scalar,
             threshold=threshold,
             slope=slope,
@@ -281,9 +286,31 @@ def generate_dtm(
         os.makedirs(temp_dtm_dir, exist_ok=True)
 
         final_dtm_path = os.path.join(final_output_folder, f"{base_name}_DTM.tif")
-        if os.path.exists(final_dtm_path):
-            print(f"Skipping {base_name}: DTM already exists -> {final_dtm_path}")
+
+        cleaned_out_dir = os.path.join(output_folder, run_name, "CLEANED_LAZ")
+        cleaned_chunk_dir = os.path.join(cleaned_out_dir, "chunks", base_name)
+        classified_out_dir = os.path.join(output_folder, run_name, "CLASSIFIED_LAZ")
+        classified_chunk_dir = os.path.join(classified_out_dir, "chunks", base_name)
+        os.makedirs(cleaned_chunk_dir, exist_ok=True)
+        os.makedirs(classified_chunk_dir, exist_ok=True)
+
+        cleaned_merged_path = os.path.join(cleaned_out_dir, f"{base_name}_cleaned_merged.laz")
+        classified_merged_path = os.path.join(classified_out_dir, f"{base_name}_classified_merged.laz")
+        ground_merged_path = os.path.join(classified_out_dir, f"{base_name}_ground_merged.laz")
+
+        dtm_exists = os.path.exists(final_dtm_path)
+        laz_merged_exist = (
+            os.path.exists(cleaned_merged_path) and
+            os.path.exists(classified_merged_path) and
+            os.path.exists(ground_merged_path)
+        )
+
+        if dtm_exists and laz_merged_exist:
+            print(f"Skipping {base_name}: DTM and merged LAZ already exist.")
             continue
+
+        if dtm_exists and not laz_merged_exist:
+            print(f"[INFO] {base_name}: DTM exists but merged LAZ missing; recomputing chunks for LAZ export.")
 
         target_wkt = get_las_footprint_wkt(las_file)
         large_chunks, small_chunks = create_chunks_from_wkt(target_wkt, chunk_size=chunk_size, overlap=chunk_overlap)
@@ -292,6 +319,7 @@ def generate_dtm(
         for large_chunk, small_chunk in zip(large_chunks, small_chunks):
             chunk_tasks.append((
                 las_file, large_chunk, small_chunk, temp_dtm_dir,
+                cleaned_chunk_dir, classified_chunk_dir,
                 threshold, scalar, slope, window, rigidness, iterations,
                 resolution, time_step, cloth_resolution,
                 fill_gaps, filter_smrf, filter_csf
@@ -309,21 +337,48 @@ def generate_dtm(
         chunk_files = sorted(glob.glob(os.path.join(temp_dtm_dir, "**", "*.tif"), recursive=True))
         print(f"[DEBUG] Found DTM chunk tif files: {len(chunk_files)}")
 
-        if not chunk_files:
+        if chunk_files:
+            merged_dtm = merge_chunks(chunk_files, final_dtm_path)
+            print("[DEBUG] merge_chunks returned:", merged_dtm)
+
+            if fill_gaps and merged_dtm:
+                filled_dtm_path = os.path.join(temp_dtm_dir, f"{base_name}_filled.tif")
+                try:
+                    shutil.copy2(merged_dtm, filled_dtm_path)
+                    fill_nodata_raster_inplace(filled_dtm_path, max_distance=10, smoothing_iterations=2)
+                    os.replace(filled_dtm_path, final_dtm_path)
+                except Exception as exc:
+                    print(f"[WARNING] DTM fill_nodata failed, using unfilled raster: {exc}")
+        elif not os.path.exists(final_dtm_path):
             print(f"No DTM chunks found for {base_name}. Skipping.")
             _list_files_recursive(temp_dtm_dir)
             continue
 
-        merged_dtm = merge_chunks(chunk_files, final_dtm_path)
-        print("[DEBUG] merge_chunks returned:", merged_dtm)
+        cleaned_chunk_files = sorted(glob.glob(os.path.join(cleaned_chunk_dir, "*_cleaned.laz")))
+        classified_chunk_files = sorted(glob.glob(os.path.join(classified_chunk_dir, "*_classified.laz")))
+        ground_chunk_files = sorted(glob.glob(os.path.join(classified_chunk_dir, "*_ground.laz")))
 
-        if fill_gaps and merged_dtm:
-            filled_dtm_path = os.path.join(temp_dtm_dir, f"{base_name}_filled.tif")
-            subprocess.run(
-                ["gdal_fillnodata.py", "-md", "10", "-si", "2", merged_dtm, filled_dtm_path],
-                check=True
-            )
-            os.replace(filled_dtm_path, final_dtm_path)
+        print(
+            f"[DEBUG] {base_name}: cleaned/classified/ground chunk files = "
+            f"{len(cleaned_chunk_files)}/{len(classified_chunk_files)}/{len(ground_chunk_files)}"
+        )
+
+        merge_laz_chunks(cleaned_chunk_files, cleaned_merged_path)
+        merge_laz_chunks(classified_chunk_files, classified_merged_path)
+        merge_laz_chunks(ground_chunk_files, ground_merged_path)
+
+        if os.path.exists(ground_merged_path) and os.path.getsize(ground_merged_path) > 0:
+            try:
+                with laspy.open(ground_merged_path) as ground_las:
+                    unique_classes = np.unique(ground_las.read().classification)
+                if len(unique_classes) > 0 and not np.all(unique_classes == 2):
+                    print(f"[WARNING] Ground merged file has non-ground classes: {unique_classes}")
+            except Exception as exc:
+                print(f"[WARNING] Could not validate ground classes for {ground_merged_path}: {exc}")
+
+        if not os.path.exists(final_dtm_path):
+            print(f"[WARNING] Missing DTM raster after chunk processing: {final_dtm_path}")
+            continue
 
         # plot
         with rasterio.open(final_dtm_path) as src:
