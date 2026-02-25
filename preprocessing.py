@@ -35,6 +35,8 @@ from core.icp_alignment import (
     extract_las_crs_info,
     compute_crop_diagnostics,
     get_open3d_info,
+    apply_transform_xyz,
+    evaluate_dz_consistency,
 )
 
 def _list_las_laz_files(las_file_dir):
@@ -88,6 +90,7 @@ def _align_and_merge_strip_files_incremental(strip_files, final_output_file, tar
         "min_points": getattr(config, "min_points", 500),
         "max_pre_dxy": getattr(config, "max_pre_dxy", 100.0),
         "max_pre_dz": getattr(config, "max_pre_dz", 5.0),
+        "dz_consistency_threshold": getattr(config, "icp_dz_consistency_threshold", 1.5),
     }
     config_hash = hashlib.sha256(json.dumps(params, sort_keys=True).encode("utf-8")).hexdigest()
     o3d_info = get_open3d_info()
@@ -161,6 +164,8 @@ def _align_and_merge_strip_files_incremental(strip_files, final_output_file, tar
                     attempt["rejected_by"].append("precheck_fail:max_pre_dz")
 
                 if not attempt["rejected_by"]:
+                    attempt["centering_applied"] = True
+                    attempt["transform_inverted"] = False
                     reg, T = run_icp(xyz_src, xyz_ref, config.icp_voxel_size, config.icp_max_corr_dist, config.icp_max_iters)
                     attempt["fitness"] = float(reg.fitness)
                     attempt["inlier_rmse"] = float(reg.inlier_rmse)
@@ -170,6 +175,13 @@ def _align_and_merge_strip_files_incremental(strip_files, final_output_file, tar
                     attempt.update({"dx": dx, "dy": dy, "dz": dz, "transform_matrix": [[float(v) for v in row] for row in T.tolist()]})
                     if abs(dz) > config.icp_max_abs_dz:
                         attempt["rejected_by"].append("max_abs_dz")
+                    xyz_src_post = apply_transform_xyz(xyz_src, T)
+                    medz_post = float(np.median(xyz_src_post[:, 2])) if len(xyz_src_post) else None
+                    medz_ref = diag.get("median_z_ref_crop")
+                    attempt["median_z_src_post"] = medz_post
+                    attempt["dz_median_post"] = (medz_post - medz_ref) if (medz_post is not None and medz_ref is not None) else None
+                    if not evaluate_dz_consistency(dz, diag.get("dz_median_pre"), getattr(config, "icp_dz_consistency_threshold", 1.5)):
+                        attempt["rejected_by"].append("dz_inconsistent_with_precheck")
 
                     if not attempt["rejected_by"]:
                         aligned_src = aligned_dir / f"{src.stem}_icp.las"
@@ -178,6 +190,22 @@ def _align_and_merge_strip_files_incremental(strip_files, final_output_file, tar
                         attempt["accepted"] = True
             except Exception as exc:
                 attempt["rejected_by"].append(f"icp_error:{exc}")
+
+
+        if not attempt["accepted"]:
+            fail_policy = getattr(config, "icp_fail_policy", "skip_merge")
+            if getattr(config, "debug_mode", False) or fail_policy == "raise":
+                attempt["fail_policy_applied"] = "raise(debug_mode)" if getattr(config, "debug_mode", False) else "raise"
+                attempt["runtime_sec"] = time.time() - t0
+                append_jsonl_record(jsonl_path, attempt)
+                raise RuntimeError(f"Preprocess ICP failed for {src}: {attempt['rejected_by']}")
+            if fail_policy in ("skip_strip", "skip_merge"):
+                attempt["fail_policy_applied"] = fail_policy
+                attempt["runtime_sec"] = time.time() - t0
+                append_jsonl_record(jsonl_path, attempt)
+                continue
+            attempt["fail_policy_applied"] = "merge_without_icp"
+            print(f"[WARNING] Preprocess ICP rejected for {src}; merging unaligned due to fail_policy=merge_without_icp. Reasons: {attempt['rejected_by']}")
 
         out_ref = ref_dir / f"ref_1to{idx}.las"
         merge_two_laz_with_pdal(accumulated_ref, moving_for_merge, out_ref)

@@ -39,6 +39,8 @@ from core.icp_alignment import (
     compute_crop_diagnostics,
     append_jsonl_record,
     get_open3d_info,
+    apply_transform_xyz,
+    evaluate_dz_consistency,
 )
 from pathlib import Path
 
@@ -463,6 +465,7 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
         "min_points": getattr(config, "min_points", 500),
         "max_pre_dxy": getattr(config, "max_pre_dxy", 100.0),
         "max_pre_dz": getattr(config, "max_pre_dz", 5.0),
+        "dz_consistency_threshold": getattr(config, "icp_dz_consistency_threshold", 1.5),
     }
     config_hash = hashlib.sha256(json.dumps(params, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -555,6 +558,8 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
                     attempt["rejected_by"].append("precheck_fail:max_pre_dz")
 
                 if not attempt["rejected_by"]:
+                    attempt["centering_applied"] = True
+                    attempt["transform_inverted"] = False
                     reg, T = run_icp(
                         source_xyz=xyz_src,
                         target_xyz=xyz_ref,
@@ -572,10 +577,11 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
                         "rotation_deg": metrics["rotation_deg"],
                         "transform_matrix": [[float(v) for v in row] for row in T.tolist()],
                     })
-                    post_dz = None
-                    if diag.get("dz_median_pre") is not None:
-                        post_dz = abs(diag["dz_median_pre"] - metrics["dz"])
-                    attempt["dz_median_post"] = post_dz
+                    xyz_src_post = apply_transform_xyz(xyz_src, T)
+                    medz_post = float(np.median(xyz_src_post[:, 2])) if len(xyz_src_post) else None
+                    medz_ref = diag.get("median_z_ref_crop")
+                    attempt["median_z_src_post"] = medz_post
+                    attempt["dz_median_post"] = (medz_post - medz_ref) if (medz_post is not None and medz_ref is not None) else None
 
                     if reg.fitness < config.icp_min_fitness:
                         attempt["rejected_by"].append("min_fitness")
@@ -583,6 +589,8 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
                         attempt["rejected_by"].append("max_abs_dz")
                     if metrics["rotation_deg"] > config.icp_max_rotation_deg:
                         attempt["rejected_by"].append("max_rotation_deg")
+                    if not evaluate_dz_consistency(metrics["dz"], diag.get("dz_median_pre"), getattr(config, "icp_dz_consistency_threshold", 1.5)):
+                        attempt["rejected_by"].append("dz_inconsistent_with_precheck")
 
                     if not attempt["rejected_by"]:
                         aligned_src = aligned_dir / f"{src.stem}_icp.laz"
@@ -605,8 +613,8 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
                 attempt["runtime_sec"] = time.time() - t0
                 append_jsonl_record(jsonl_path, attempt)
                 raise RuntimeError(f"ICP step {step_id} failed: {attempt['rejected_by']}")
-            if config.icp_fail_policy == "skip_strip":
-                attempt["fail_policy_applied"] = "skip_strip"
+            if config.icp_fail_policy in ("skip_strip", "skip_merge"):
+                attempt["fail_policy_applied"] = config.icp_fail_policy
                 attempt["runtime_sec"] = time.time() - t0
                 append_jsonl_record(jsonl_path, attempt)
                 write_icp_report_txt(
@@ -624,6 +632,7 @@ def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_
                 )
                 continue
             attempt["fail_policy_applied"] = "merge_without_icp"
+            print(f"[WARNING] ICP rejected for {src}; merging without ICP due to fail_policy=merge_without_icp. Reasons: {attempt['rejected_by']}")
             moving_for_merge = src
 
         out_ref = ref_dir / f"ref_1to{step_id}.laz"

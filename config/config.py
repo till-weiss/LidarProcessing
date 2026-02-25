@@ -109,7 +109,7 @@ class Configuration:
         self.icp_min_fitness = 0.30  # Minimum ICP fitness to accept transform
         self.icp_max_abs_dz = 1.00  # Maximum absolute dz shift (m) to accept transform
         self.icp_max_rotation_deg = 1.00  # Maximum rotation angle (degrees) to accept transform
-        self.icp_fail_policy = "merge_without_icp"  # One of: merge_without_icp, skip_strip, raise
+        self.icp_fail_policy = "skip_merge"  # One of: skip_merge, merge_without_icp, skip_strip, raise
         self.icp_use_overlap_crop = True  # If True, run ICP on overlap-only cropped subsets
         self.debug_mode = False  # If True, fail-fast behaviour for ICP precheck/runtime errors
         self.strict_crs_check = True  # If True, require compatible CRS/units before ICP runs
@@ -117,6 +117,7 @@ class Configuration:
         self.min_points = 500  # Minimum points required in each overlap crop to run ICP
         self.max_pre_dxy = 100.0  # Max centroid XY distance (m) allowed before ICP
         self.max_pre_dz = 5.0  # Max median Z delta (m) allowed before ICP
+        self.icp_dz_consistency_threshold = 1.5  # Max allowed difference between pre-check dz median and ICP dz (m)
 
         # Set overall GDAL settings
         gdal.UseExceptions()  # Enable exceptions instead of silent failures

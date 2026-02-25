@@ -34,8 +34,14 @@ def to_o3d(xyz: np.ndarray):
 
 
 def run_icp(source_xyz: np.ndarray, target_xyz: np.ndarray, voxel_size: float, max_dist: float, max_iters: int):
-    src = to_o3d(source_xyz)
-    tgt = to_o3d(target_xyz)
+    # Centre both clouds for numerical stability, then un-centre the returned transform.
+    c_src = np.mean(source_xyz, axis=0)
+    c_tgt = np.mean(target_xyz, axis=0)
+    src_centered = source_xyz - c_src
+    tgt_centered = target_xyz - c_tgt
+
+    src = to_o3d(src_centered)
+    tgt = to_o3d(tgt_centered)
 
     src = src.voxel_down_sample(float(voxel_size))
     tgt = tgt.voxel_down_sample(float(voxel_size))
@@ -52,7 +58,14 @@ def run_icp(source_xyz: np.ndarray, target_xyz: np.ndarray, voxel_size: float, m
         o3d.pipelines.registration.TransformationEstimationPointToPlane(),
         o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(max_iters)),
     )
-    return reg, np.asarray(reg.transformation)
+    t_prime = np.asarray(reg.transformation)
+
+    t_uncentre_tgt = np.eye(4)
+    t_uncentre_tgt[:3, 3] = c_tgt
+    t_uncentre_src = np.eye(4)
+    t_uncentre_src[:3, 3] = -c_src
+    t_world = t_uncentre_tgt @ t_prime @ t_uncentre_src
+    return reg, t_world
 
 
 def compute_overlap_bbox_from_headers(ref_laz: Path, src_laz: Path, buffer_m: float) -> Optional[tuple[float, float, float, float]]:
@@ -126,6 +139,21 @@ def metrics_from_T(T: np.ndarray) -> dict:
     c = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
     angle_deg = math.degrees(math.acos(c))
     return {"dx": dx, "dy": dy, "dz": dz, "rotation_deg": angle_deg}
+
+
+def apply_transform_xyz(xyz: np.ndarray, T: np.ndarray) -> np.ndarray:
+    if xyz.size == 0:
+        return xyz
+    ones = np.ones((xyz.shape[0], 1), dtype=np.float64)
+    hom = np.hstack([xyz, ones])
+    out = (T @ hom.T).T
+    return out[:, :3]
+
+
+def evaluate_dz_consistency(dz_from_transform: float, dz_median_pre: Optional[float], threshold: float) -> bool:
+    if dz_median_pre is None:
+        return True
+    return abs(float(dz_from_transform) - float(dz_median_pre)) <= float(threshold)
 
 
 def write_icp_report_txt(report_path: Path, step_id: int, ref_path: Path, src_path: Path,
