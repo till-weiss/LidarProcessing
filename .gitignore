@@ -16,9 +16,24 @@ Thumbs.db
 
 # Pixi
 .pixi/
+<<<<<<< HEAD
 >>>>>>> 03c3961 (Stop tracking pycache files)
 
+=======
+
+# Python cache
+>>>>>>> 06177cd (Ignore Python cache files)
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+<<<<<<< HEAD
+=======
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Pixi env
+.pixi/
+>>>>>>> 06177cd (Ignore Python cache files)
