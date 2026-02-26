@@ -83,17 +83,41 @@ class Configuration:
         self.overlap = 0.0  # min overlap (fraction) between pointcloud and AOI. Typical 0.05–0.3.
 
         self.filter_date = False  # Filter las files by date
+<<<<<<< HEAD
 
         self.automatic_date_parser = True # get dates from target area only for Region_Site_Date_Res_Order filenames
 
 
         self.start_date = '2023-07-10'  # Start date for filtering las files
         self.end_date = '2023-07-10'  # End date for filtering las files
+=======
+        self.start_date = '2023-07-22'  # Start date for filtering las files
+        self.end_date = '2026-07-20'  # End date for filtering las files
+>>>>>>> 3395522 (Update)
 
         # _______ Processing _______
         self.chunk_size = 1000  # chunk size (m). 250–1000 typical. Larger = fewer edges, more memory.
         self.chunk_overlap = 0.1  # chunk overlap (fraction). 0.05–0.3. More reduces seam artifacts.
         self.num_workers = 8  # parallel workers. <= physical cores/RAM capacity.
+
+        # _______ Strip-level ICP alignment _______
+        self.enable_strip_icp = False  # Enable incremental ICP on strip-level ground merged LAZ before AOI-level merge
+        self.icp_voxel_size = 1.0  # Voxel size (m) for ICP downsampling
+        self.icp_max_corr_dist = 2.0  # Maximum correspondence distance (m) for ICP
+        self.icp_max_iters = 80  # Maximum ICP iterations
+        self.icp_overlap_buffer_m = 10.0  # Buffer around overlap bbox (m) used for ICP subsets
+        self.icp_min_fitness = 0.30  # Minimum ICP fitness to accept transform
+        self.icp_max_abs_dz = 1.00  # Maximum absolute dz shift (m) to accept transform
+        self.icp_max_rotation_deg = 1.00  # Maximum rotation angle (degrees) to accept transform
+        self.icp_fail_policy = "skip_merge"  # One of: skip_merge, merge_without_icp, skip_strip, raise
+        self.icp_use_overlap_crop = True  # If True, run ICP on overlap-only cropped subsets
+        self.debug_mode = False  # If True, fail-fast behaviour for ICP precheck/runtime errors
+        self.strict_crs_check = True  # If True, require compatible CRS/units before ICP runs
+        self.debug_artefacts = True  # If True, keep overlap subset artefacts for inspection
+        self.min_points = 500  # Minimum points required in each overlap crop to run ICP
+        self.max_pre_dxy = 100.0  # Max centroid XY distance (m) allowed before ICP
+        self.max_pre_dz = 5.0  # Max median Z delta (m) allowed before ICP
+        self.icp_dz_consistency_threshold = 1.5  # Max allowed difference between pre-check dz median and ICP dz (m)
 
         # Set overall GDAL settings
         gdal.UseExceptions()  # Enable exceptions instead of silent failures

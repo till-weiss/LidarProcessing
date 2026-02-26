@@ -6,12 +6,16 @@ import pdal
 import laspy
 import numpy as np
 import subprocess
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from tqdm import tqdm
 from scipy.spatial import KDTree
 import rasterio
 import signal
 import functools
+import hashlib
+import uuid
+import socket
+import sys
 import shutil 
 from matplotlib import pyplot as plt
 from rasterio.warp import reproject, Resampling
@@ -21,7 +25,25 @@ from multiprocessing import get_context
 import multiprocessing
 from shapely.wkt import loads as wkt_loads, dumps as wkt_dumps
 
-from core.processing_windowed import create_chunks_from_wkt, process_chunk_to_dsm, process_chunk_to_dem ,merge_chunks
+from core.processing_windowed import create_chunks_from_wkt, process_chunk_to_dsm, process_chunk_to_dem_with_laz_outputs, merge_chunks, merge_laz_chunks, fill_nodata_raster_inplace
+from core.icp_alignment import (
+    read_xyz_laspy,
+    run_icp,
+    compute_overlap_bbox_from_headers,
+    crop_bbox_with_pdal,
+    apply_transformation_with_pdal,
+    merge_two_laz_with_pdal,
+    metrics_from_T,
+    write_icp_report_txt,
+    extract_las_crs_info,
+    compute_crop_diagnostics,
+    append_jsonl_record,
+    get_open3d_info,
+    apply_transform_xyz,
+    evaluate_dz_consistency,
+)
+from pathlib import Path
+
 
 
 def check_resolution(las_file, resolution, method="sampling", num_samples=10000):
@@ -141,9 +163,12 @@ def generate_dsm(input_folder, output_folder, run_name, method, resolution, chun
             merged_dsm = merge_chunks(chunk_files, final_dsm_path)
             if fill_gaps and merged_dsm:
                 filled_dsm_path = os.path.join(temp_dsm_dir, f"{base_name}_filled.tif")
-                subprocess.run(["gdal_fillnodata.py", "-md", "10", "-si", "2", merged_dsm, filled_dsm_path],
-                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                os.replace(filled_dsm_path, final_dsm_path)
+                try:
+                    shutil.copy2(merged_dsm, filled_dsm_path)
+                    fill_nodata_raster_inplace(filled_dsm_path, max_distance=10, smoothing_iterations=2)
+                    os.replace(filled_dsm_path, final_dsm_path)
+                except Exception as exc:
+                    print(f"[WARNING] DSM fill_nodata failed, using unfilled raster: {exc}")
 
             #read output file for plotting
             with rasterio.open(final_dsm_path) as src:
@@ -171,32 +196,59 @@ def generate_dsm(input_folder, output_folder, run_name, method, resolution, chun
 
 
 def process_dtm_chunk_wrapper(args):
-    (las_file, large_chunk, small_chunk, output_dir, threshold,
-     scalar, slope, window, rigidness, iterations, resolution,
-     time_step, cloth_resolution, fill_gaps, filter_smrf, filter_csf) = args
-    return process_chunk_to_dem(input_file=las_file, large_chunk_bbox=large_chunk, small_chunk_bbox=small_chunk, temp_dir=output_dir, scalar=scalar, threshold=threshold, slope=slope, window=window, rigidness=rigidness, iterations=iterations, resolution=resolution, time_step=time_step, cloth_resolution=cloth_resolution, fill_gaps=fill_gaps, filter_smrf=filter_smrf, filter_csf=filter_csf)
+    (las_file, large_chunk, small_chunk, output_dir, cleaned_chunk_dir,
+     classified_chunk_dir, threshold, scalar, slope, window, rigidness,
+     iterations, resolution, time_step, cloth_resolution, fill_gaps,
+     filter_smrf, filter_csf) = args
+
+    return process_chunk_to_dem_with_laz_outputs(
+        input_file=las_file,
+        large_chunk_bbox=large_chunk,
+        small_chunk_bbox=small_chunk,
+        temp_dir=output_dir,
+        cleaned_chunk_dir=cleaned_chunk_dir,
+        classified_chunk_dir=classified_chunk_dir,
+        scalar=scalar,
+        threshold=threshold,
+        slope=slope,
+        window=window,
+        rigidness=rigidness,
+        iterations=iterations,
+        resolution=resolution,
+        time_step=time_step,
+        cloth_resolution=cloth_resolution,
+        fill_gaps=fill_gaps,
+        filter_smrf=filter_smrf,
+        filter_csf=filter_csf
+    )
+
 
 def generate_dtm(input_folder, output_folder, run_name, resolution, chunk_size, fill_gaps, num_workers, method, chunk_overlap, threshold, scalar, slope, window, rigidness, iterations, time_step, cloth_resolution, filter_smrf, filter_csf):
-    
+
     final_output_folder = os.path.join(output_folder, run_name, 'DTM')
     os.makedirs(final_output_folder, exist_ok=True)
     temp_folder = os.path.join(final_output_folder, "temp")
     os.makedirs(temp_folder, exist_ok=True)
-    
+
     start_time = time.time()
-    las_files = glob.glob(os.path.join(input_folder, run_name, "*.las")) + \
-                glob.glob(os.path.join(input_folder, run_name, "*.laz"))
-    
+    las_files = glob.glob(os.path.join(input_folder, run_name, "*.las")) +                 glob.glob(os.path.join(input_folder, run_name, "*.laz"))
+
     if not las_files:
         print("No LAS/LAZ files found. Exiting DTM generation.")
         return
-    
 
     for las_file in tqdm(las_files, desc="Processing LAS files", unit="file"):
-        
+
         base_name = os.path.splitext(os.path.basename(las_file))[0]
         temp_dtm_dir = os.path.join(temp_folder, base_name)
         final_dtm_path = os.path.join(final_output_folder, f"{base_name}_DTM.tif")
+
+        cleaned_out_dir = os.path.join(output_folder, run_name, "CLEANED_LAZ")
+        cleaned_chunk_dir = os.path.join(cleaned_out_dir, "chunks", base_name)
+        classified_out_dir = os.path.join(output_folder, run_name, "CLASSIFIED_LAZ")
+        classified_chunk_dir = os.path.join(classified_out_dir, "chunks", base_name)
+        os.makedirs(cleaned_chunk_dir, exist_ok=True)
+        os.makedirs(classified_chunk_dir, exist_ok=True)
 
         if not os.path.exists(final_dtm_path):
 
@@ -204,11 +256,9 @@ def generate_dtm(input_folder, output_folder, run_name, resolution, chunk_size, 
             avg_spacing, is_resolution_ok = check_resolution(las_file, resolution, method)
             if not is_resolution_ok:
                 print(f"Warning: DTM resolution ({resolution}m) is finer than avg spacing ({avg_spacing:.3f}m).")
-            
-            base_name = os.path.splitext(os.path.basename(las_file))[0]
-            temp_dtm_dir = os.path.join(temp_folder, base_name)
+
             os.makedirs(temp_dtm_dir, exist_ok=True)
-            
+
             large_chunks, small_chunks = create_chunks_from_wkt(
                 target_wkt,
                 chunk_size=chunk_size,
@@ -216,62 +266,82 @@ def generate_dtm(input_folder, output_folder, run_name, resolution, chunk_size, 
             )
 
             chunk_tasks = []
-            
             for large_chunk, small_chunk in zip(large_chunks, small_chunks):
                 chunk_tasks.append((
                     las_file, large_chunk, small_chunk, temp_dtm_dir,
-                    threshold,      # correct position
-                    scalar,         # correct position
-                    slope, window, rigidness, iterations,
+                    cleaned_chunk_dir, classified_chunk_dir,
+                    threshold, scalar, slope, window, rigidness, iterations,
                     resolution, time_step, cloth_resolution,
                     fill_gaps, filter_smrf, filter_csf
                 ))
 
-        
+            print(f"[DEBUG] {base_name}: DTM n_chunk_tasks={len(chunk_tasks)}")
+            print(f"[DEBUG] {base_name}: cleaned chunks -> {cleaned_chunk_dir}")
+            print(f"[DEBUG] {base_name}: classified chunks -> {classified_chunk_dir}")
+
             with multiprocessing.Pool(processes=num_workers) as pool:
-                    list(tqdm(
-                        pool.imap_unordered(process_dtm_chunk_wrapper, chunk_tasks),
-                        total=len(chunk_tasks),
-                        desc="Processing DTM Chunks"))
-            
+                list(tqdm(
+                    pool.imap_unordered(process_dtm_chunk_wrapper, chunk_tasks),
+                    total=len(chunk_tasks),
+                    desc="Processing DTM Chunks"))
+
             chunk_files = sorted(glob.glob(os.path.join(temp_dtm_dir, "*.tif")))
             if not chunk_files:
                 print(f"No DTM chunks found for {base_name}. Skipping.")
                 continue
-            
+
             merged_dtm = merge_chunks(chunk_files, final_dtm_path)
-            
+
             if fill_gaps and merged_dtm:
                 filled_dtm_path = os.path.join(temp_dtm_dir, f"{base_name}_filled.tif")
-                subprocess.run(
-                    ["gdal_fillnodata.py", "-md", "10", "-si", "2", merged_dtm, filled_dtm_path],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                os.replace(filled_dtm_path, final_dtm_path)
+                try:
+                    shutil.copy2(merged_dtm, filled_dtm_path)
+                    fill_nodata_raster_inplace(filled_dtm_path, max_distance=10, smoothing_iterations=2)
+                    os.replace(filled_dtm_path, final_dtm_path)
+                except Exception as exc:
+                    print(f"[WARNING] DTM fill_nodata failed, using unfilled raster: {exc}")
+
+            cleaned_chunk_files = sorted(glob.glob(os.path.join(cleaned_chunk_dir, "*_cleaned.laz")))
+            classified_chunk_files = sorted(glob.glob(os.path.join(classified_chunk_dir, "*_classified.laz")))
+            ground_chunk_files = sorted(glob.glob(os.path.join(classified_chunk_dir, "*_ground.laz")))
+
+            print(f"[DEBUG] {base_name}: cleaned/classified/ground chunk files = "
+                  f"{len(cleaned_chunk_files)}/{len(classified_chunk_files)}/{len(ground_chunk_files)}")
+
+            ground_merged_path = os.path.join(classified_out_dir, f"{base_name}_ground_merged.laz")
+            merge_laz_chunks(cleaned_chunk_files, os.path.join(cleaned_out_dir, f"{base_name}_cleaned_merged.laz"))
+            merge_laz_chunks(classified_chunk_files, os.path.join(classified_out_dir, f"{base_name}_classified_merged.laz"))
+            merge_laz_chunks(ground_chunk_files, ground_merged_path)
+
+            if os.path.exists(ground_merged_path) and os.path.getsize(ground_merged_path) > 0:
+                try:
+                    with laspy.open(ground_merged_path) as ground_las:
+                        ground_points = ground_las.read()
+                        unique_classes = np.unique(ground_points.classification)
+                    if len(unique_classes) > 0 and not np.all(unique_classes == 2):
+                        print(f"[WARNING] Ground merged file has non-ground classes: {unique_classes}")
+                except Exception as exc:
+                    print(f"[WARNING] Could not validate ground classes for {ground_merged_path}: {exc}")
 
             with rasterio.open(final_dtm_path) as src:
                 dtm_data = src.read(1)
                 dtm_nodata = src.nodata if src.nodata is not None else np.nan
                 dtm_data = np.where(dtm_data == dtm_nodata, np.nan, dtm_data)
 
-            # Plot the merged DSM and save as PNG
             plt.figure(figsize=(10, 10))
             plt.imshow(dtm_data, cmap='terrain', vmin=np.nanpercentile(dtm_data, 2), vmax=np.nanpercentile(dtm_data, 98))
             plt.colorbar(label='Elevation (m)')
             plt.title(f'DTM: {base_name}')
             plt.axis('off')
             plt.savefig(os.path.join(final_output_folder, f"{base_name}_DTM.png"), bbox_inches='tight', pad_inches=0.1)
-            plt.close()  # Ensure we close the plot to free memory
+            plt.close()
 
-            shutil.rmtree(temp_dtm_dir, ignore_errors=True)
-            
+            # keep temp rasters for debugging
+            # shutil.rmtree(temp_dtm_dir, ignore_errors=True)
+
         else:
             print(f"Skipping {base_name}: DTM already exists.")
-        
-        
-    
+
     elapsed_time = timedelta(seconds=int(time.time() - start_time))
     print(f"\nDTM generation completed in {elapsed_time}.")
 
@@ -364,6 +434,244 @@ def generate_chm(input_folder, output_folder, run_name):
     print(f"\nCHM generation completed in {elapsed_time}.")
 
 
+
+
+def align_and_merge_ground_strips_incremental(ground_strip_paths, out_root, run_name, config):
+    out_root = Path(out_root)
+    ground_strip_paths = sorted([Path(p) for p in ground_strip_paths], key=lambda p: p.name)
+    if not ground_strip_paths:
+        raise ValueError("No ground strip paths provided for ICP alignment.")
+
+    aligned_dir = out_root / run_name / "ICP_ALIGNED"
+    ref_dir = aligned_dir / "ref_steps"
+    reports_dir = out_root / run_name / "ICP_REPORT"
+    tmp_dir = reports_dir / "tmp"
+    for d in [aligned_dir, ref_dir, reports_dir, tmp_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"_{uuid.uuid4().hex[:8]}"
+    jsonl_path = reports_dir / f"icp_attempts_{run_id}.jsonl"
+
+    params = {
+        "voxel_size": config.icp_voxel_size,
+        "max_dist": config.icp_max_corr_dist,
+        "max_iters": config.icp_max_iters,
+        "overlap_buffer_m": config.icp_overlap_buffer_m,
+        "min_fitness": config.icp_min_fitness,
+        "max_abs_dz": config.icp_max_abs_dz,
+        "max_rotation_deg": config.icp_max_rotation_deg,
+        "fail_policy": config.icp_fail_policy,
+        "strict_crs_check": getattr(config, "strict_crs_check", True),
+        "min_points": getattr(config, "min_points", 500),
+        "max_pre_dxy": getattr(config, "max_pre_dxy", 100.0),
+        "max_pre_dz": getattr(config, "max_pre_dz", 5.0),
+        "dz_consistency_threshold": getattr(config, "icp_dz_consistency_threshold", 1.5),
+    }
+    config_hash = hashlib.sha256(json.dumps(params, sort_keys=True).encode("utf-8")).hexdigest()
+
+    o3d_info = get_open3d_info()
+    if getattr(config, "debug_mode", False) and not o3d_info["open3d_available"]:
+        raise RuntimeError("Open3D is unavailable and debug_mode=True; aborting ICP.")
+
+    accumulated_ref = ref_dir / "ref_1.laz"
+    shutil.copy2(ground_strip_paths[0], accumulated_ref)
+
+    aligned_strips = [accumulated_ref]
+    ref_steps = [accumulated_ref]
+
+    attempt_counter = 0
+    for idx, src in enumerate(ground_strip_paths[1:], start=2):
+        attempt_counter += 1
+        step_id = idx
+        t0 = time.time()
+        attempt = {
+            "run_id": run_id,
+            "attempt_id": f"{step_id}_{uuid.uuid4().hex}",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "hostname": socket.gethostname(),
+            "sys.executable": sys.executable,
+            "python_version": sys.version,
+            "open3d_available": o3d_info["open3d_available"],
+            "open3d_version": o3d_info["open3d_version"],
+            "config_hash": config_hash,
+            "ref_path": str(accumulated_ref),
+            "src_path": str(src),
+            "overlap_bbox": None,
+            "crs": {},
+            "accepted": False,
+            "rejected_by": [],
+            "fail_policy_applied": None,
+            "used_moving_for_merge": None,
+        }
+
+        overlap_bbox = compute_overlap_bbox_from_headers(accumulated_ref, src, config.icp_overlap_buffer_m)
+        attempt["overlap_bbox"] = overlap_bbox
+
+        ref_crs = extract_las_crs_info(accumulated_ref)
+        src_crs = extract_las_crs_info(src)
+        attempt["crs"] = {"ref": ref_crs, "src": src_crs}
+
+        if overlap_bbox is None:
+            attempt["rejected_by"].append("precheck_fail:no_overlap")
+
+        # strict CRS gate
+        if getattr(config, "strict_crs_check", True):
+            ref_present = ref_crs.get("present")
+            src_present = src_crs.get("present")
+            if ref_present != src_present:
+                attempt["rejected_by"].append("precheck_fail:missing_crs")
+            if ref_present and src_present:
+                ref_epsg = ref_crs.get("epsg") or ref_crs.get("horizontal")
+                src_epsg = src_crs.get("epsg") or src_crs.get("horizontal")
+                if ref_epsg != src_epsg:
+                    attempt["rejected_by"].append("precheck_fail:crs_mismatch")
+                ref_units = tuple(ref_crs.get("units") or [])
+                src_units = tuple(src_crs.get("units") or [])
+                if ref_units != src_units:
+                    attempt["rejected_by"].append("precheck_fail:unit_mismatch")
+
+        reg = None
+        T = np.eye(4)
+        moving_for_merge = src
+        diag = {}
+
+        if not attempt["rejected_by"] and overlap_bbox is not None:
+            try:
+                ref_for_icp = accumulated_ref
+                src_for_icp = src
+                if config.icp_use_overlap_crop:
+                    ref_for_icp = tmp_dir / f"tmp_ref_subset_step_{step_id}.laz"
+                    src_for_icp = tmp_dir / f"tmp_src_subset_step_{step_id}.laz"
+                    crop_bbox_with_pdal(accumulated_ref, ref_for_icp, overlap_bbox)
+                    crop_bbox_with_pdal(src, src_for_icp, overlap_bbox)
+
+                xyz_ref = read_xyz_laspy(ref_for_icp)
+                xyz_src = read_xyz_laspy(src_for_icp)
+                diag = compute_crop_diagnostics(xyz_ref, xyz_src)
+                attempt.update(diag)
+
+                if diag["n_ref_crop"] < config.min_points or diag["n_src_crop"] < config.min_points:
+                    attempt["rejected_by"].append("precheck_fail:empty_or_sparse_overlap")
+                if diag.get("dxy_centroid_pre") is not None and diag["dxy_centroid_pre"] > config.max_pre_dxy:
+                    attempt["rejected_by"].append("precheck_fail:max_pre_dxy")
+                if diag.get("dz_median_pre") is not None and abs(diag["dz_median_pre"]) > config.max_pre_dz:
+                    attempt["rejected_by"].append("precheck_fail:max_pre_dz")
+
+                if not attempt["rejected_by"]:
+                    attempt["centering_applied"] = True
+                    attempt["transform_inverted"] = False
+                    reg, T = run_icp(
+                        source_xyz=xyz_src,
+                        target_xyz=xyz_ref,
+                        voxel_size=config.icp_voxel_size,
+                        max_dist=config.icp_max_corr_dist,
+                        max_iters=config.icp_max_iters,
+                    )
+                    metrics = metrics_from_T(T)
+                    attempt.update({
+                        "fitness": float(reg.fitness),
+                        "inlier_rmse": float(reg.inlier_rmse),
+                        "dx": metrics["dx"],
+                        "dy": metrics["dy"],
+                        "dz": metrics["dz"],
+                        "rotation_deg": metrics["rotation_deg"],
+                        "transform_matrix": [[float(v) for v in row] for row in T.tolist()],
+                    })
+                    xyz_src_post = apply_transform_xyz(xyz_src, T)
+                    medz_post = float(np.median(xyz_src_post[:, 2])) if len(xyz_src_post) else None
+                    medz_ref = diag.get("median_z_ref_crop")
+                    attempt["median_z_src_post"] = medz_post
+                    attempt["dz_median_post"] = (medz_post - medz_ref) if (medz_post is not None and medz_ref is not None) else None
+
+                    if reg.fitness < config.icp_min_fitness:
+                        attempt["rejected_by"].append("min_fitness")
+                    if abs(metrics["dz"]) > config.icp_max_abs_dz:
+                        attempt["rejected_by"].append("max_abs_dz")
+                    if metrics["rotation_deg"] > config.icp_max_rotation_deg:
+                        attempt["rejected_by"].append("max_rotation_deg")
+                    if not evaluate_dz_consistency(metrics["dz"], diag.get("dz_median_pre"), getattr(config, "icp_dz_consistency_threshold", 1.5)):
+                        attempt["rejected_by"].append("dz_inconsistent_with_precheck")
+
+                    if not attempt["rejected_by"]:
+                        aligned_src = aligned_dir / f"{src.stem}_icp.laz"
+                        apply_transformation_with_pdal(src, aligned_src, T)
+                        moving_for_merge = aligned_src
+                        aligned_strips.append(aligned_src)
+                        attempt["accepted"] = True
+            except Exception as exc:
+                attempt["rejected_by"].append(f"icp_error:{exc}")
+
+        if not attempt["accepted"]:
+            if getattr(config, "debug_mode", False):
+                attempt["fail_policy_applied"] = "raise(debug_mode)"
+                attempt["runtime_sec"] = time.time() - t0
+                append_jsonl_record(jsonl_path, attempt)
+                raise RuntimeError(f"ICP step {step_id} failed in debug_mode: {attempt['rejected_by']}")
+
+            if config.icp_fail_policy == "raise":
+                attempt["fail_policy_applied"] = "raise"
+                attempt["runtime_sec"] = time.time() - t0
+                append_jsonl_record(jsonl_path, attempt)
+                raise RuntimeError(f"ICP step {step_id} failed: {attempt['rejected_by']}")
+            if config.icp_fail_policy in ("skip_strip", "skip_merge"):
+                attempt["fail_policy_applied"] = config.icp_fail_policy
+                attempt["runtime_sec"] = time.time() - t0
+                append_jsonl_record(jsonl_path, attempt)
+                write_icp_report_txt(
+                    report_path=reports_dir / f"icp_step_{step_id}.txt",
+                    step_id=step_id,
+                    ref_path=accumulated_ref,
+                    src_path=src,
+                    params=params,
+                    reg=reg,
+                    T=T,
+                    runtime_sec=time.time() - t0,
+                    accepted=False,
+                    reason=", ".join(attempt["rejected_by"]),
+                    overlap_bbox=overlap_bbox,
+                )
+                continue
+            attempt["fail_policy_applied"] = "merge_without_icp"
+            print(f"[WARNING] ICP rejected for {src}; merging without ICP due to fail_policy=merge_without_icp. Reasons: {attempt['rejected_by']}")
+            moving_for_merge = src
+
+        out_ref = ref_dir / f"ref_1to{step_id}.laz"
+        merge_two_laz_with_pdal(accumulated_ref, moving_for_merge, out_ref)
+        accumulated_ref = out_ref
+        ref_steps.append(out_ref)
+
+        attempt["used_moving_for_merge"] = str(moving_for_merge)
+        attempt["out_ref"] = str(out_ref)
+        attempt["runtime_sec"] = time.time() - t0
+        append_jsonl_record(jsonl_path, attempt)
+
+        write_icp_report_txt(
+            report_path=reports_dir / f"icp_step_{step_id}.txt",
+            step_id=step_id,
+            ref_path=ref_steps[-2],
+            src_path=src,
+            params=params,
+            reg=reg,
+            T=T,
+            runtime_sec=attempt["runtime_sec"],
+            accepted=attempt["accepted"],
+            reason=", ".join(attempt["rejected_by"]) if attempt["rejected_by"] else None,
+            overlap_bbox=overlap_bbox,
+        )
+
+    final_merged_aligned = aligned_dir / "ground_merged_aligned.laz"
+    shutil.copy2(accumulated_ref, final_merged_aligned)
+
+    return {
+        "aligned_strips": aligned_strips,
+        "ref_steps": ref_steps,
+        "final_ref": accumulated_ref,
+        "final_merged_aligned": final_merged_aligned,
+        "reports_dir": reports_dir,
+        "ledger_path": jsonl_path,
+        "run_id": run_id,
+    }
+
 def process_all(config):
     """
     Runs DSM generation using cleaned LAS files.
@@ -393,17 +701,39 @@ def process_all(config):
 
     if config.create_DEM:
         print("\n========== Starting DEM Generation ==========")
+
+        dtm_input_folder = config.preprocessed_dir
+        dtm_run_name = config.run_name
+
+        if getattr(config, "enable_strip_icp", False):
+            strip_inputs = sorted(
+                glob.glob(os.path.join(config.preprocessed_dir, config.run_name, "*.las")) +
+                glob.glob(os.path.join(config.preprocessed_dir, config.run_name, "*.laz"))
+            )
+            if len(strip_inputs) < 2:
+                print("[INFO] Strip ICP enabled but fewer than 2 strip LAS/LAZ inputs were found; skipping pre-merge ICP.")
+            else:
+                print(f"[INFO] Running strip ICP on {len(strip_inputs)} unmerged strip inputs before merge.")
+                icp_result = align_and_merge_ground_strips_incremental(
+                    ground_strip_paths=strip_inputs,
+                    out_root=Path(config.results_dir),
+                    run_name=config.run_name,
+                    config=config
+                )
+                print(f"[INFO] ICP merged aligned output: {icp_result['final_merged_aligned']}")
+                print(f"[INFO] ICP reports: {icp_result['reports_dir']}")
+
         generate_dtm(
-            input_folder=config.preprocessed_dir,
+            input_folder=dtm_input_folder,
             output_folder=config.results_dir,
-            run_name=config.run_name,
+            run_name=dtm_run_name,
             resolution=config.resolution,
             chunk_size=config.chunk_size,
             fill_gaps=config.fill_gaps,
             method=config.point_density_method,
             scalar=config.smrf_scalar,
             slope=config.smrf_slope,
-            window=config.smrf_window_size, 
+            window=config.smrf_window_size,
             rigidness = config.csf_rigidness,
             time_step=config.csf_time_step,
             cloth_resolution=config.csf_cloth_resolution,
@@ -414,6 +744,7 @@ def process_all(config):
             filter_csf=config.csf_filter,
             threshold=config.threshold
         )
+
 
     if config.create_CHM:
         print("\n========== Starting CHM Generation ==========")
